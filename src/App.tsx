@@ -16,15 +16,13 @@ interface HoveredTweet {
     y: number
 }
 
-// Parallax chat client connected to backend on port 3001
-// Automatically falls back to Groq if Parallax times out
-const PARALLAX_ENDPOINT = 'http://localhost:3001/v1/chat/completions'
+// API configuration - set VITE_API_BACKEND to 'parallax' to use local backend
+const API_BACKEND = import.meta.env.VITE_API_BACKEND || 'groq'
+const PARALLAX_ENDPOINT = import.meta.env.VITE_PARALLAX_ENDPOINT || 'http://localhost:8000/v1/chat/completions'
 const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || ''
-const PARALLAX_MODEL = 'Qwen/Qwen3-0.6B'
-const GROQ_MODEL = 'llama-3.1-8b-instant'
-// Timeout for Parallax requests before falling back to Groq (ms)
-const PARALLAX_TIMEOUT = 8000
+const GROQ_MODEL = 'llama-3.3-70b-versatile'
+const PARALLAX_MODEL = import.meta.env.VITE_PARALLAX_MODEL || 'default'
 
 // Helper to make request with timeout
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number): Promise<Response> {
@@ -47,7 +45,7 @@ const REPLY_STYLES = [
     { style: 'supportive', label: 'supportive', prompt: 'Be warm and encouraging. Validate their point and add genuine support.' },
 ]
 
-const ANTI_AI_RULES = `
+const STYLE_RULES = `
 CRITICAL RULES - VIOLATIONS WILL BE REJECTED:
 - NEVER use em dashes (—) under any circumstances
 - NEVER ask questions to "elicit engagement" or prompt responses
@@ -104,39 +102,37 @@ function App() {
 
             const prompt = `You are writing a tweet reply. Style: ${styleInfo.prompt}
 
-${ANTI_AI_RULES}
+${STYLE_RULES}
 
 ${extraInstruction ? `ADDITIONAL INSTRUCTION: ${extraInstruction}\n` : ''}
 Rules:
 - all lowercase always
 - under 180 characters
 - directly respond to what they said
-- sound like a real person, not an AI
+- sound like a real person typing casually
 
 Tweet to reply to: "${tweetText.slice(0, 500)}"
 
 Write ONLY the reply text, nothing else:`
 
-            // Try Parallax first, then fallback to Groq
+            // Use configured API backend with retry logic
             const maxRetries = 3
             let lastError: Error | null = null
-            let usedBackend = 'parallax'
+            const useParallax = API_BACKEND === 'parallax'
+            const endpoint = useParallax ? PARALLAX_ENDPOINT : GROQ_ENDPOINT
+            const model = useParallax ? PARALLAX_MODEL : GROQ_MODEL
 
             for (let attempt = 0; attempt < maxRetries; attempt++) {
                 try {
-                    // First attempt: try Parallax with timeout
-                    // Subsequent attempts or after Parallax failure: use Groq
-                    const useParallax = attempt === 0 && usedBackend === 'parallax'
-                    const endpoint = useParallax ? PARALLAX_ENDPOINT : GROQ_ENDPOINT
-                    const model = useParallax ? PARALLAX_MODEL : GROQ_MODEL
+                    console.log(`[API] Attempt ${attempt + 1} using ${useParallax ? 'Parallax' : 'Groq'}`)
+
                     const headers: Record<string, string> = {
                         'Content-Type': 'application/json',
                     }
-                    if (!useParallax) {
+                    // Only add Authorization header for Groq
+                    if (!useParallax && GROQ_API_KEY) {
                         headers['Authorization'] = `Bearer ${GROQ_API_KEY}`
                     }
-
-                    console.log(`[API] Attempt ${attempt + 1} using ${useParallax ? 'Parallax' : 'Groq'}`)
 
                     const response = await fetchWithTimeout(endpoint, {
                         method: 'POST',
@@ -147,7 +143,7 @@ Write ONLY the reply text, nothing else:`
                             max_tokens: 80,
                             temperature: 1.0,
                         })
-                    }, useParallax ? PARALLAX_TIMEOUT : 30000)
+                    }, 30000)
 
                     if (response.status === 429) {
                         // Rate limited - wait and retry
@@ -179,12 +175,6 @@ Write ONLY the reply text, nothing else:`
                     lastError = error instanceof Error ? error : new Error('unknown error')
                     const isAbort = error instanceof Error && error.name === 'AbortError'
                     console.error(`[API] Attempt ${attempt + 1} failed (${isAbort ? 'timeout' : 'error'}):`, error)
-
-                    // If Parallax failed/timed out, switch to Groq for remaining attempts
-                    if (usedBackend === 'parallax') {
-                        console.log('[API] Parallax failed, switching to Groq fallback')
-                        usedBackend = 'groq'
-                    }
                 }
             }
 
@@ -205,6 +195,69 @@ Write ONLY the reply text, nothing else:`
     // Keep ref in sync
     generateRepliesRef.current = generateReplies
 
+    // Handle clipboard request from webview console messages
+    const handleConsoleMessage = useCallback(async (event: any) => {
+        const message = event.message
+        // Log all webview console messages for debugging
+        if (message && (message.startsWith('[CLIPBOARD') || message.startsWith('[PASTE'))) {
+            console.log('[RENDERER] Webview console:', message)
+        }
+        if (message && message.startsWith('[CLIPBOARD_REQUEST]')) {
+            console.log('[RENDERER] Got clipboard request from webview')
+            try {
+                const jsonStr = message.replace('[CLIPBOARD_REQUEST]', '').trim()
+                const request = JSON.parse(jsonStr)
+                if (request.type === 'clipboard-paste-request') {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const electronAPI = (window as any).electronAPI
+                    if (!electronAPI) {
+                        console.log('[RENDERER] electronAPI not available!')
+                        return
+                    }
+
+                    const webview = webviewRef.current
+                    if (!webview) {
+                        console.log('[RENDERER] webview not available!')
+                        return
+                    }
+
+                    // Check for image first
+                    console.log('[RENDERER] Checking clipboard for image...')
+                    const hasImage = await electronAPI.clipboardHasImage()
+                    console.log('[RENDERER] hasImage:', hasImage)
+                    if (hasImage) {
+                        const imageDataUrl = await electronAPI.clipboardReadImage()
+                        console.log('[RENDERER] Got image dataUrl, length:', imageDataUrl?.length)
+                        if (imageDataUrl) {
+                            webview.executeJavaScript(`
+                                window.postMessage({
+                                    type: 'clipboard-paste-response',
+                                    requestId: '${request.requestId}',
+                                    dataType: 'image',
+                                    data: '${imageDataUrl}'
+                                }, '*');
+                            `)
+                            return
+                        }
+                    }
+
+                    // Fall back to text
+                    const text = await electronAPI.clipboardReadText()
+                    webview.executeJavaScript(`
+                        window.postMessage({
+                            type: 'clipboard-paste-response',
+                            requestId: '${request.requestId}',
+                            dataType: 'text',
+                            data: ${JSON.stringify(text)}
+                        }, '*');
+                    `)
+                }
+            } catch (err) {
+                console.error('[CLIPBOARD] Error parsing request:', err)
+            }
+        }
+    }, [])
+
     // Callback ref for webview - triggers when element is mounted
     const webviewCallbackRef = useCallback((webview: any) => {
         console.log('[REF] Webview callback ref called:', !!webview)
@@ -218,6 +271,9 @@ Write ONLY the reply text, nothing else:`
             }
             webview.addEventListener('dom-ready', handleDomReady)
 
+            // Set up console-message listener for clipboard requests
+            webview.addEventListener('console-message', handleConsoleMessage)
+
             // Also check if already loaded
             setTimeout(() => {
                 if (!webviewInitializedRef.current && webview.getURL && webview.getURL()) {
@@ -226,7 +282,7 @@ Write ONLY the reply text, nothing else:`
                 }
             }, 100)
         }
-    }, [])
+    }, [handleConsoleMessage])
 
     // Webview initialization function
     const initializeWebview = useCallback((webview: any) => {
@@ -249,18 +305,31 @@ Write ONLY the reply text, nothing else:`
       }
       [data-testid="placementTracking"] { display: none !important; }
 
-      .ai-hover {
+      .parallax-hover {
         background: rgba(29, 155, 240, 0.15) !important;
         outline: 2px solid rgba(29, 155, 240, 0.6) !important;
         outline-offset: -2px;
         border-radius: 12px;
+      }
+
+      /* When chat expand mode is active, disable virtualization */
+      body.parallax-chat-expand [data-testid="DmScrollerContainer"] {
+        height: auto !important;
+        max-height: none !important;
+        overflow: visible !important;
+      }
+      body.parallax-chat-expand [data-testid="DmScrollerContainer"] > div {
+        height: auto !important;
+        max-height: none !important;
+        overflow: visible !important;
+        transform: none !important;
       }
     `)
 
         // Inject JavaScript
         webview.executeJavaScript(`
       (function() {
-        console.log('[WEBVIEW] Initializing AI helper...');
+        console.log('[WEBVIEW] Initializing Parallax helper...');
 
         window.isCtrlPressed = false;
         window.hoveredTweetText = null;
@@ -297,24 +366,24 @@ Write ONLY the reply text, nothing else:`
           const article = window.lastArticleUnderMouse;
           if (!window.isCtrlPressed) {
             if (window.currentHoveredArticle) {
-              window.currentHoveredArticle.classList.remove('ai-hover');
+              window.currentHoveredArticle.classList.remove('parallax-hover');
               window.currentHoveredArticle = null;
             }
             return;
           }
           if (!article) {
             if (window.currentHoveredArticle) {
-              window.currentHoveredArticle.classList.remove('ai-hover');
+              window.currentHoveredArticle.classList.remove('parallax-hover');
               window.currentHoveredArticle = null;
             }
             return;
           }
           if (article !== window.currentHoveredArticle) {
             if (window.currentHoveredArticle) {
-              window.currentHoveredArticle.classList.remove('ai-hover');
+              window.currentHoveredArticle.classList.remove('parallax-hover');
             }
             window.currentHoveredArticle = article;
-            article.classList.add('ai-hover');
+            article.classList.add('parallax-hover');
           }
         }
 
@@ -379,7 +448,7 @@ Write ONLY the reply text, nothing else:`
           window.currentHoveredArticle = null;
           window.hoveredTweetText = null;
           window.isCtrlPressed = false;
-          document.querySelectorAll('.ai-hover').forEach(el => el.classList.remove('ai-hover'));
+          document.querySelectorAll('.parallax-hover').forEach(el => el.classList.remove('parallax-hover'));
           return true;
         };
 
@@ -390,10 +459,271 @@ Write ONLY the reply text, nothing else:`
                             document.querySelector('button[aria-label*="Back"]');
             if (backBtn) { backBtn.click(); e.preventDefault(); }
           }
+
+          // Ctrl+Shift+E: Expand/load all DM chat messages
+          if (e.ctrlKey && e.shiftKey && e.key === 'E') {
+            e.preventDefault();
+            console.log('[CHAT] Expanding chat history...');
+            console.log('[CHAT] Current URL:', window.location.href);
+
+            // Check if we're in a DM conversation
+            const isDM = window.location.href.includes('/messages/');
+            if (!isDM) {
+              console.log('[CHAT] Not in a DM URL');
+              alert('Not in a DM conversation. Navigate to Messages first.');
+              return;
+            }
+
+            // Log all potential containers for debugging
+            console.log('[CHAT] Looking for scrollable containers...');
+            const allScrollables = document.querySelectorAll('[style*="overflow"], [class*="scroll"]');
+            console.log('[CHAT] Found scrollable elements:', allScrollables.length);
+
+            // Find the main conversation area - look for the scrollable section
+            let scroller = null;
+            const potentialScrollers = [
+              ...document.querySelectorAll('section[role="region"]'),
+              ...document.querySelectorAll('[data-testid*="Dm"]'),
+              ...document.querySelectorAll('[data-testid*="dm"]'),
+              ...document.querySelectorAll('[data-testid*="conversation"]'),
+              ...document.querySelectorAll('[aria-label*="message"]'),
+              ...document.querySelectorAll('[aria-label*="Message"]'),
+              ...document.querySelectorAll('main section'),
+              ...document.querySelectorAll('[role="main"] section'),
+            ];
+
+            console.log('[CHAT] Potential scrollers found:', potentialScrollers.length);
+            potentialScrollers.forEach((el, i) => {
+              console.log('[CHAT] Scroller', i, ':', el.tagName, el.getAttribute('data-testid'), el.getAttribute('aria-label'));
+            });
+
+            // Find the one with scrollable content
+            for (const el of potentialScrollers) {
+              if (el.scrollHeight > el.clientHeight) {
+                scroller = el;
+                console.log('[CHAT] Found scrollable container:', el.tagName, el.getAttribute('data-testid'));
+                break;
+              }
+            }
+
+            // Fallback: just find any scrollable div in main content area
+            if (!scroller) {
+              const mainArea = document.querySelector('[role="main"]') || document.querySelector('main') || document.body;
+              const divs = mainArea.querySelectorAll('div');
+              for (const div of divs) {
+                if (div.scrollHeight > div.clientHeight + 100 && div.clientHeight > 200) {
+                  scroller = div;
+                  console.log('[CHAT] Found scrollable div fallback');
+                  break;
+                }
+              }
+            }
+
+            if (!scroller) {
+              console.log('[CHAT] No scrollable container found');
+              alert('Could not find chat container. Try scrolling manually first, then press Ctrl+Shift+E again.');
+              return;
+            }
+
+            // Auto-scroll to load all messages
+            window.parallaxChatExpand = async () => {
+              let lastScrollTop = -1;
+              let iterations = 0;
+              const maxIterations = 500; // Safety limit
+
+              console.log('[CHAT] Starting auto-scroll to load all messages...');
+              console.log('[CHAT] Container scrollHeight:', scroller.scrollHeight, 'clientHeight:', scroller.clientHeight);
+
+              // Scroll to top repeatedly to load older messages
+              while (iterations < maxIterations) {
+                const prevScrollHeight = scroller.scrollHeight;
+                scroller.scrollTop = 0; // Scroll to very top
+                await new Promise(r => setTimeout(r, 400));
+
+                // Check if more content loaded
+                if (scroller.scrollHeight === prevScrollHeight && scroller.scrollTop === 0) {
+                  // Wait a bit more and check again
+                  await new Promise(r => setTimeout(r, 800));
+                  if (scroller.scrollHeight === prevScrollHeight) {
+                    console.log('[CHAT] No more content loading, stopping');
+                    break;
+                  }
+                }
+
+                iterations++;
+                if (iterations % 10 === 0) {
+                  console.log('[CHAT] Scroll iteration', iterations, '- scrollHeight:', scroller.scrollHeight);
+                }
+              }
+
+              console.log('[CHAT] Finished loading after', iterations, 'iterations. Extracting messages...');
+
+              // Now extract all visible text from the conversation
+              const messages = [];
+              const seen = new Set();
+
+              // Get all text-containing elements in the scroller
+              const textEls = scroller.querySelectorAll('span, div[dir="auto"], [data-testid*="tweet"], [data-testid*="message"]');
+              console.log('[CHAT] Found', textEls.length, 'text elements');
+
+              textEls.forEach(el => {
+                // Skip if this element contains other text elements (to avoid duplication)
+                if (el.querySelector('span, div[dir="auto"]')) return;
+
+                const text = el.innerText?.trim();
+                if (text && text.length > 0 && !seen.has(text)) {
+                  seen.add(text);
+                  messages.push(text);
+                }
+              });
+
+              const fullText = messages.join('\\n');
+              console.log('[CHAT] Extracted', messages.length, 'unique text segments');
+              console.log('[CHAT] Total characters:', fullText.length);
+
+              // Copy to clipboard
+              try {
+                await navigator.clipboard.writeText(fullText);
+                alert('Chat copied! ' + messages.length + ' segments, ' + fullText.length + ' chars');
+              } catch (err) {
+                console.error('[CHAT] Clipboard write failed:', err);
+                // Fallback: create a temporary textarea
+                const ta = document.createElement('textarea');
+                ta.value = fullText;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                alert('Chat copied (fallback)! ' + messages.length + ' segments');
+              }
+            };
+
+            window.parallaxChatExpand();
+          }
         }, true);
 
-        window.aiHelperReady = true;
-        console.log('[WEBVIEW] AI helper initialized successfully!');
+        // Clipboard paste interception for image support
+        window.pendingPasteRequests = {};
+        window.pasteInProgress = false;
+
+        window.addEventListener('message', (event) => {
+          if (event.data && event.data.type === 'clipboard-paste-response') {
+            const { requestId, dataType, data } = event.data;
+            const resolver = window.pendingPasteRequests[requestId];
+            if (resolver) {
+              resolver({ dataType, data });
+              delete window.pendingPasteRequests[requestId];
+            }
+          }
+        });
+
+        // Handle Ctrl+V directly via keydown to ensure it's not blocked
+        document.addEventListener('keydown', async (e) => {
+          if ((e.ctrlKey || e.metaKey) && e.key === 'v' && !window.pasteInProgress) {
+            const activeEl = document.activeElement;
+            const isInComposer = activeEl && (
+              activeEl.matches('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"], [role="textbox"], [contenteditable="true"]') ||
+              activeEl.closest('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"], [role="textbox"], [contenteditable="true"]')
+            );
+
+            if (!isInComposer) return;
+
+            console.log('[CLIPBOARD] Ctrl+V detected in composer, requesting clipboard data...');
+            window.pasteInProgress = true;
+
+            const requestId = Date.now() + '_' + Math.random().toString(36).slice(2);
+
+            const clipboardPromise = new Promise((resolve) => {
+              window.pendingPasteRequests[requestId] = resolve;
+              setTimeout(() => {
+                if (window.pendingPasteRequests[requestId]) {
+                  delete window.pendingPasteRequests[requestId];
+                  resolve(null);
+                }
+              }, 2000);
+            });
+
+            console.log('[CLIPBOARD_REQUEST]', JSON.stringify({ type: 'clipboard-paste-request', requestId }));
+
+            const result = await clipboardPromise;
+            window.pasteInProgress = false;
+
+            if (result && result.dataType === 'image' && result.data) {
+              e.preventDefault();
+              e.stopPropagation();
+
+              try {
+                console.log('[CLIPBOARD] Processing image data, length:', result.data.length);
+                // Convert data URL to blob without using fetch (which may be blocked by CSP)
+                const dataUrl = result.data;
+                const parts = dataUrl.split(',');
+                const mimeMatch = parts[0].match(/:(.*?);/);
+                const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+                const bstr = atob(parts[1]);
+                let n = bstr.length;
+                const u8arr = new Uint8Array(n);
+                while (n--) {
+                  u8arr[n] = bstr.charCodeAt(n);
+                }
+                const blob = new Blob([u8arr], { type: mime });
+                console.log('[CLIPBOARD] Blob created, size:', blob.size, 'type:', blob.type);
+                const file = new File([blob], 'pasted-image.png', { type: 'image/png' });
+                console.log('[CLIPBOARD] File created, size:', file.size);
+
+                const dt = new DataTransfer();
+                dt.items.add(file);
+
+                // Find ALL file inputs - there may be multiple (reply composer vs main composer modal)
+                const fileInputs = document.querySelectorAll('input[type="file"][accept*="image"]');
+                console.log('[CLIPBOARD] Found file inputs:', fileInputs.length);
+
+                // Try each file input
+                fileInputs.forEach((fileInput, idx) => {
+                  try {
+                    console.log('[CLIPBOARD] Trying file input', idx, fileInput.getAttribute('data-testid'));
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'files').set;
+                    nativeInputValueSetter.call(fileInput, dt.files);
+                    fileInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                    fileInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                  } catch (err) {
+                    console.log('[CLIPBOARD] File input', idx, 'failed:', err);
+                  }
+                });
+
+                // Find the active composer (could be main tweet box or reply modal)
+                const composers = document.querySelectorAll('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"]');
+                console.log('[CLIPBOARD] Found composers:', composers.length);
+
+                composers.forEach((composer, idx) => {
+                  // Find the closest container that handles drops
+                  const dropTarget = composer.closest('[data-testid="toolBar"]')?.parentElement ||
+                                     composer.closest('[role="dialog"]') ||
+                                     composer.closest('[data-testid="primaryColumn"]') ||
+                                     composer.parentElement;
+
+                  if (dropTarget) {
+                    console.log('[CLIPBOARD] Dispatching drop to composer', idx);
+                    dropTarget.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
+                    dropTarget.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+                    dropTarget.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+                  }
+                });
+
+              } catch (err) {
+                console.error('[CLIPBOARD] Error processing image:', err);
+              }
+            } else if (result && result.dataType === 'text' && result.data) {
+              // For text, let the default paste happen or insert manually
+              console.log('[CLIPBOARD] Text paste, inserting:', result.data.slice(0, 50));
+              document.execCommand('insertText', false, result.data);
+              e.preventDefault();
+            }
+            // If no result or not image, let default paste behavior continue
+          }
+        }, true);
+
+        window.parallaxReady = true;
+        console.log('[WEBVIEW] Parallax helper initialized successfully!');
       })();
     `).then(() => {
             console.log('[INIT] JS injection complete! Setting webviewReady = true')
@@ -414,12 +744,402 @@ Write ONLY the reply text, nothing else:`
         })
     }
 
+    // Listen for paste trigger from Electron menu and forward to webview
+    useEffect(() => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const electronAPI = (window as any).electronAPI
+        if (electronAPI && electronAPI.onTriggerPaste) {
+            electronAPI.onTriggerPaste(async () => {
+                console.log('[PASTE] Menu paste triggered, forwarding to webview...')
+                const webview = webviewRef.current
+                if (!webview || !webviewReadyRef.current) {
+                    console.log('[PASTE] Webview not ready')
+                    return
+                }
+
+                // Trigger paste handling in webview by simulating keydown
+                try {
+                    await webview.executeJavaScript(`
+                        (function() {
+                            console.log('[PASTE] Received paste trigger from menu');
+                            // Dispatch a synthetic Ctrl+V keydown event
+                            const event = new KeyboardEvent('keydown', {
+                                key: 'v',
+                                code: 'KeyV',
+                                ctrlKey: true,
+                                bubbles: true,
+                                cancelable: true
+                            });
+                            document.activeElement.dispatchEvent(event);
+                        })();
+                    `)
+                } catch (err) {
+                    console.error('[PASTE] Failed to trigger paste in webview:', err)
+                }
+            })
+        }
+
+        // Listen for chat export trigger from global shortcut
+        if (electronAPI && electronAPI.onTriggerChatExport) {
+            electronAPI.onTriggerChatExport(async () => {
+                console.log('[CHAT] Global shortcut triggered chat export')
+                const webview = webviewRef.current
+                if (!webview || !webviewReadyRef.current) {
+                    console.log('[CHAT] Webview not ready')
+                    return
+                }
+
+                try {
+                    // Get the folder path first
+                    const folder = await electronAPI.getScreenshotsFolder()
+                    alert(`Starting chat screenshot export...\n\nScreenshots will be saved to:\n${folder}\n\nClick OK to begin. This may take a while for long conversations.`)
+
+                    // Create timestamp folder for this export
+                    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+                    const exportFolder = `chat-export-${timestamp}`
+
+                    // First, scroll to top to load all messages
+                    await webview.executeJavaScript(`
+                        (async function() {
+                            // Find scrollable container
+                            let scroller = null;
+                            const allDivs = document.querySelectorAll('div');
+                            for (const div of allDivs) {
+                                const style = window.getComputedStyle(div);
+                                if ((style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+                                    div.scrollHeight > div.clientHeight + 100 &&
+                                    div.clientHeight > 200) {
+                                    scroller = div;
+                                    break;
+                                }
+                            }
+
+                            if (!scroller) {
+                                console.log('[CHAT] No scroller found');
+                                return { error: 'no scroller' };
+                            }
+
+                            // Scroll to top to load all messages
+                            console.log('[CHAT] Scrolling to top to load all messages...');
+                            let prevHeight = 0;
+                            let sameCount = 0;
+                            while (sameCount < 3) {
+                                scroller.scrollTop = 0;
+                                await new Promise(r => setTimeout(r, 500));
+                                if (scroller.scrollHeight === prevHeight) {
+                                    sameCount++;
+                                } else {
+                                    sameCount = 0;
+                                    prevHeight = scroller.scrollHeight;
+                                }
+                            }
+
+                            // Store scroller info for later
+                            window._chatScroller = scroller;
+                            window._chatScrollHeight = scroller.scrollHeight;
+                            window._chatClientHeight = scroller.clientHeight;
+
+                            console.log('[CHAT] Ready for screenshots. Total height:', scroller.scrollHeight);
+                            return {
+                                totalHeight: scroller.scrollHeight,
+                                viewportHeight: scroller.clientHeight
+                            };
+                        })();
+                    `)
+
+                    // Now take screenshots page by page
+                    let pageNum = 0
+                    let hasMore = true
+
+                    while (hasMore) {
+                        // Capture the current view
+                        const image = await webview.capturePage()
+                        const dataUrl = image.toDataURL()
+
+                        // Save screenshot
+                        const filename = `${exportFolder}/page-${String(pageNum).padStart(4, '0')}.png`
+                        const saveResult = await electronAPI.saveScreenshot(dataUrl, filename)
+
+                        if (!saveResult.success) {
+                            console.error('[CHAT] Failed to save screenshot:', saveResult.error)
+                        } else {
+                            console.log('[CHAT] Saved page', pageNum)
+                        }
+
+                        // Scroll down by viewport height
+                        const scrollResult = await webview.executeJavaScript(`
+                            (function() {
+                                const scroller = window._chatScroller;
+                                if (!scroller) return { done: true };
+
+                                const prevScroll = scroller.scrollTop;
+                                scroller.scrollTop += scroller.clientHeight - 50; // Small overlap
+
+                                // Check if we've reached the bottom
+                                const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10;
+                                const didntMove = scroller.scrollTop === prevScroll;
+
+                                return {
+                                    done: atBottom || didntMove,
+                                    scrollTop: scroller.scrollTop,
+                                    scrollHeight: scroller.scrollHeight
+                                };
+                            })();
+                        `)
+
+                        hasMore = !scrollResult.done
+                        pageNum++
+
+                        // Small delay to let content render
+                        await new Promise(r => setTimeout(r, 300))
+
+                        // Safety limit
+                        if (pageNum > 1000) {
+                            console.log('[CHAT] Hit page limit')
+                            break
+                        }
+                    }
+
+                    alert(`Chat export complete!\n\n${pageNum} screenshots saved to:\n${folder}/${exportFolder}`)
+
+                } catch (err) {
+                    console.error('[CHAT] Error:', err)
+                    alert('Error exporting chat: ' + err)
+                }
+            })
+        }
+    }, [])
+
+    // Handle clipboard messages from webview
+    useEffect(() => {
+        const handleClipboardMessage = async (event: MessageEvent) => {
+            const webview = webviewRef.current
+            if (!webview) return
+
+            const { type, requestId } = event.data || {}
+
+            if (type === 'clipboard-paste-request') {
+                try {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const electronAPI = (window as any).electronAPI
+                    if (!electronAPI) {
+                        console.error('[CLIPBOARD] electronAPI not available')
+                        return
+                    }
+
+                    // Check for image first
+                    const hasImage = await electronAPI.clipboardHasImage()
+                    if (hasImage) {
+                        const imageDataUrl = await electronAPI.clipboardReadImage()
+                        if (imageDataUrl) {
+                            webview.executeJavaScript(`
+                                (function() {
+                                    window.postMessage({
+                                        type: 'clipboard-paste-response',
+                                        requestId: '${requestId}',
+                                        dataType: 'image',
+                                        data: '${imageDataUrl}'
+                                    }, '*');
+                                })();
+                            `)
+                            return
+                        }
+                    }
+
+                    // Fall back to text
+                    const text = await electronAPI.clipboardReadText()
+                    webview.executeJavaScript(`
+                        (function() {
+                            window.postMessage({
+                                type: 'clipboard-paste-response',
+                                requestId: '${requestId}',
+                                dataType: 'text',
+                                data: ${JSON.stringify(text)}
+                            }, '*');
+                        })();
+                    `)
+                } catch (error) {
+                    console.error('[CLIPBOARD] Error handling paste request:', error)
+                }
+            } else if (type === 'clipboard-copy-request') {
+                try {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const electronAPI = (window as any).electronAPI
+                    if (!electronAPI) return
+
+                    const { dataType, data } = event.data
+                    if (dataType === 'image') {
+                        await electronAPI.clipboardWriteImage(data)
+                    } else {
+                        await electronAPI.clipboardWriteText(data)
+                    }
+                } catch (error) {
+                    console.error('[CLIPBOARD] Error handling copy request:', error)
+                }
+            }
+        }
+
+        window.addEventListener('message', handleClipboardMessage)
+        return () => window.removeEventListener('message', handleClipboardMessage)
+    }, [])
+
+    // Set up webview IPC message forwarding
+    useEffect(() => {
+        const webview = webviewRef.current
+        if (!webview) return
+
+        const handleIpcMessage = (event: any) => {
+            const { channel, args } = event
+            if (channel === 'clipboard-request') {
+                window.postMessage(args[0], '*')
+            }
+        }
+
+        webview.addEventListener('ipc-message', handleIpcMessage)
+        return () => webview.removeEventListener('ipc-message', handleIpcMessage)
+    }, [webviewReady])
+
     // Parent-level Ctrl tracking (works when parent has focus)
     useEffect(() => {
-        const handleKeyDown = (e: KeyboardEvent) => {
+        const handleKeyDown = async (e: KeyboardEvent) => {
             if (e.key === 'Control') {
                 ctrlPressedRef.current = true
                 setIsCtrlPressed(true)
+            }
+
+            // Log all Ctrl+Shift combinations for debugging
+            if (e.ctrlKey && e.shiftKey) {
+                console.log('[KEY] Ctrl+Shift+' + e.key + ' pressed (code: ' + e.code + ')')
+            }
+
+            // Ctrl+Shift+E: Export DM chat history
+            if (e.ctrlKey && e.shiftKey && (e.key === 'E' || e.key === 'e' || e.code === 'KeyE')) {
+                e.preventDefault()
+                console.log('[CHAT] Ctrl+Shift+E pressed - exporting chat')
+
+                const webview = webviewRef.current
+                if (!webview || !webviewReadyRef.current) {
+                    console.log('[CHAT] Webview not ready')
+                    return
+                }
+
+                try {
+                    const result = await webview.executeJavaScript(`
+                        (async function() {
+                            console.log('[CHAT] Starting chat export...');
+                            console.log('[CHAT] URL:', window.location.href);
+
+                            // Log current URL for debugging
+                            const url = window.location.href;
+                            console.log('[CHAT] Current URL:', url);
+                            
+                            // Skip URL check - just try to find a conversation container
+                            // This will work on any page with scrollable chat content
+
+                            // Find scrollable container
+                            let scroller = null;
+                            const mainArea = document.querySelector('[role="main"]') || document.body;
+                            const allDivs = mainArea.querySelectorAll('div');
+
+                            for (const div of allDivs) {
+                                const style = window.getComputedStyle(div);
+                                const isScrollable = style.overflowY === 'auto' || style.overflowY === 'scroll';
+                                const hasScroll = div.scrollHeight > div.clientHeight + 50;
+                                const isBigEnough = div.clientHeight > 300;
+
+                                if (isScrollable && hasScroll && isBigEnough) {
+                                    scroller = div;
+                                    console.log('[CHAT] Found scroller:', div.className?.slice(0, 50));
+                                    break;
+                                }
+                            }
+
+                            if (!scroller) {
+                                return { error: 'Could not find chat scroll container.' };
+                            }
+
+                            // Scroll to top to load all messages
+                            console.log('[CHAT] Scrolling to load all messages...');
+                            let iterations = 0;
+                            const maxIter = 300;
+
+                            while (iterations < maxIter) {
+                                const prevHeight = scroller.scrollHeight;
+                                scroller.scrollTop = 0;
+                                await new Promise(r => setTimeout(r, 300));
+
+                                if (scroller.scrollHeight === prevHeight) {
+                                    await new Promise(r => setTimeout(r, 500));
+                                    if (scroller.scrollHeight === prevHeight) {
+                                        break;
+                                    }
+                                }
+                                iterations++;
+                                if (iterations % 20 === 0) {
+                                    console.log('[CHAT] Scroll iter', iterations);
+                                }
+                            }
+
+                            console.log('[CHAT] Done scrolling after', iterations, 'iterations');
+
+                            // Extract messages
+                            const messages = [];
+                            const seen = new Set();
+
+                            // Get leaf text nodes
+                            const walker = document.createTreeWalker(
+                                scroller,
+                                NodeFilter.SHOW_TEXT,
+                                null,
+                                false
+                            );
+
+                            let node;
+                            while (node = walker.nextNode()) {
+                                const text = node.textContent?.trim();
+                                if (text && text.length > 0 && !seen.has(text)) {
+                                    seen.add(text);
+                                    messages.push(text);
+                                }
+                            }
+
+                            console.log('[CHAT] Extracted', messages.length, 'text segments');
+
+                            const fullText = messages.join('\\n');
+
+                            // Copy to clipboard
+                            try {
+                                await navigator.clipboard.writeText(fullText);
+                            } catch (e) {
+                                const ta = document.createElement('textarea');
+                                ta.value = fullText;
+                                ta.style.position = 'fixed';
+                                ta.style.opacity = '0';
+                                document.body.appendChild(ta);
+                                ta.select();
+                                document.execCommand('copy');
+                                document.body.removeChild(ta);
+                            }
+
+                            return {
+                                success: true,
+                                count: messages.length,
+                                chars: fullText.length
+                            };
+                        })();
+                    `)
+
+                    console.log('[CHAT] Result:', result)
+
+                    if (result.error) {
+                        alert(result.error)
+                    } else if (result.success) {
+                        alert('Chat exported! ' + result.count + ' segments, ' + result.chars + ' characters copied to clipboard.')
+                    }
+                } catch (err) {
+                    console.error('[CHAT] Error:', err)
+                    alert('Error exporting chat: ' + err)
+                }
             }
         }
         const handleKeyUp = (e: KeyboardEvent) => {
@@ -473,7 +1193,7 @@ Write ONLY the reply text, nothing else:`
               text: window.hoveredTweetText || null,
               x: window.lastMouseX || 0,
               y: window.lastMouseY || 0,
-              helperReady: !!window.aiHelperReady
+              helperReady: !!window.parallaxReady
             };
           })()
         `)
@@ -549,14 +1269,14 @@ Write ONLY the reply text, nothing else:`
             const webview = webviewRef.current
             if (!webview || !webviewReadyRef.current) return
             try {
-                const ready = await webview.executeJavaScript(`!!window.aiHelperReady`)
+                const ready = await webview.executeJavaScript(`!!window.parallaxReady`)
                 if (!ready) {
-                    console.log('[HEALTH] AI helper not ready, reinitializing...')
+                    console.log('[HEALTH] Parallax helper not ready, reinitializing...')
                     // Reinject the helper JS with same logic as main init
                     await webview.executeJavaScript(`
             (function() {
-              if (window.aiHelperReady) return;
-              console.log('[WEBVIEW] Reinitializing AI helper...');
+              if (window.parallaxReady) return;
+              console.log('[WEBVIEW] Reinitializing Parallax helper...');
 
               window.isCtrlPressed = false;
               window.hoveredTweetText = null;
@@ -593,24 +1313,24 @@ Write ONLY the reply text, nothing else:`
                 const article = window.lastArticleUnderMouse;
                 if (!window.isCtrlPressed) {
                   if (window.currentHoveredArticle) {
-                    window.currentHoveredArticle.classList.remove('ai-hover');
+                    window.currentHoveredArticle.classList.remove('parallax-hover');
                     window.currentHoveredArticle = null;
                   }
                   return;
                 }
                 if (!article) {
                   if (window.currentHoveredArticle) {
-                    window.currentHoveredArticle.classList.remove('ai-hover');
+                    window.currentHoveredArticle.classList.remove('parallax-hover');
                     window.currentHoveredArticle = null;
                   }
                   return;
                 }
                 if (article !== window.currentHoveredArticle) {
                   if (window.currentHoveredArticle) {
-                    window.currentHoveredArticle.classList.remove('ai-hover');
+                    window.currentHoveredArticle.classList.remove('parallax-hover');
                   }
                   window.currentHoveredArticle = article;
-                  article.classList.add('ai-hover');
+                  article.classList.add('parallax-hover');
                 }
               };
 
@@ -652,7 +1372,7 @@ Write ONLY the reply text, nothing else:`
                 window.currentHoveredArticle = null;
                 window.hoveredTweetText = null;
                 window.isCtrlPressed = false;
-                document.querySelectorAll('.ai-hover').forEach(el => el.classList.remove('ai-hover'));
+                document.querySelectorAll('.parallax-hover').forEach(el => el.classList.remove('parallax-hover'));
                 return true;
               };
 
@@ -664,8 +1384,108 @@ Write ONLY the reply text, nothing else:`
                 }
               }, true);
 
-              window.aiHelperReady = true;
-              console.log('[WEBVIEW] AI helper reinitialized!');
+              // Clipboard paste interception for image support
+              if (!window.pendingPasteRequests) {
+                window.pendingPasteRequests = {};
+                window.pasteInProgress = false;
+
+                window.addEventListener('message', (event) => {
+                  if (event.data && event.data.type === 'clipboard-paste-response') {
+                    const { requestId, dataType, data } = event.data;
+                    const resolver = window.pendingPasteRequests[requestId];
+                    if (resolver) {
+                      resolver({ dataType, data });
+                      delete window.pendingPasteRequests[requestId];
+                    }
+                  }
+                });
+
+                // Handle Ctrl+V directly via keydown
+                document.addEventListener('keydown', async (e) => {
+                  if ((e.ctrlKey || e.metaKey) && e.key === 'v' && !window.pasteInProgress) {
+                    const activeEl = document.activeElement;
+                    const isInComposer = activeEl && (
+                      activeEl.matches('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"], [role="textbox"], [contenteditable="true"]') ||
+                      activeEl.closest('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"], [role="textbox"], [contenteditable="true"]')
+                    );
+                    if (!isInComposer) return;
+
+                    console.log('[CLIPBOARD] Ctrl+V detected in composer');
+                    window.pasteInProgress = true;
+
+                    const requestId = Date.now() + '_' + Math.random().toString(36).slice(2);
+                    const clipboardPromise = new Promise((resolve) => {
+                      window.pendingPasteRequests[requestId] = resolve;
+                      setTimeout(() => {
+                        if (window.pendingPasteRequests[requestId]) {
+                          delete window.pendingPasteRequests[requestId];
+                          resolve(null);
+                        }
+                      }, 2000);
+                    });
+
+                    console.log('[CLIPBOARD_REQUEST]', JSON.stringify({ type: 'clipboard-paste-request', requestId }));
+
+                    const result = await clipboardPromise;
+                    window.pasteInProgress = false;
+
+                    if (result && result.dataType === 'image' && result.data) {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      try {
+                        // Convert data URL to blob without using fetch (may be blocked by CSP)
+                        const dataUrl = result.data;
+                        const parts = dataUrl.split(',');
+                        const mimeMatch = parts[0].match(/:(.*?);/);
+                        const mime = mimeMatch ? mimeMatch[1] : 'image/png';
+                        const bstr = atob(parts[1]);
+                        let n = bstr.length;
+                        const u8arr = new Uint8Array(n);
+                        while (n--) {
+                          u8arr[n] = bstr.charCodeAt(n);
+                        }
+                        const blob = new Blob([u8arr], { type: mime });
+                        const file = new File([blob], 'pasted-image.png', { type: 'image/png' });
+                        const dt = new DataTransfer();
+                        dt.items.add(file);
+
+                        // Find ALL file inputs
+                        const fileInputs = document.querySelectorAll('input[type="file"][accept*="image"]');
+                        fileInputs.forEach((fileInput) => {
+                          try {
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'files').set;
+                            nativeInputValueSetter.call(fileInput, dt.files);
+                            fileInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+                            fileInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                          } catch (err) {}
+                        });
+
+                        // Try drop on all composers
+                        const composers = document.querySelectorAll('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"]');
+                        composers.forEach((composer) => {
+                          const dropTarget = composer.closest('[data-testid="toolBar"]')?.parentElement ||
+                                             composer.closest('[role="dialog"]') ||
+                                             composer.closest('[data-testid="primaryColumn"]') ||
+                                             composer.parentElement;
+                          if (dropTarget) {
+                            dropTarget.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
+                            dropTarget.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
+                            dropTarget.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+                          }
+                        });
+                      } catch (err) {
+                        console.error('[CLIPBOARD] Error processing image:', err);
+                      }
+                    } else if (result && result.dataType === 'text' && result.data) {
+                      document.execCommand('insertText', false, result.data);
+                      e.preventDefault();
+                    }
+                  }
+                }, true);
+              }
+
+              window.parallaxReady = true;
+              console.log('[WEBVIEW] Parallax helper reinitialized!');
             })();
           `)
                 }
@@ -735,7 +1555,11 @@ Write ONLY the reply text, nothing else:`
                 ref={webviewCallbackRef}
                 src="https://x.com/home"
                 className="w-full h-full"
-                {...{ allowpopups: 'true', partition: 'persist:x' } as any}
+                {...{
+                    allowpopups: 'true',
+                    partition: 'persist:x',
+                    webpreferences: 'contextIsolation=no, javascript=yes, images=yes, webSecurity=yes'
+                } as any}
             />
 
             {/* Ctrl indicator */}
@@ -788,7 +1612,7 @@ Write ONLY the reply text, nothing else:`
                                             transition={{ duration: 0.8, repeat: Infinity }}
                                             className="w-2 h-2 bg-blue-400 rounded-full"
                                         />
-                                        <span className="text-sm font-semibold text-blue-400">AI Replies</span>
+                                        <span className="text-sm font-semibold text-blue-400">Replies</span>
                                     </div>
                                     <button
                                         onClick={handleRegenerate}

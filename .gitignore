@@ -1,3 +1,17 @@
+# Dependencies
+node_modules
+
+# Build output
+dist
+dist-ssr
+out
+*.local
+
+# Environment files (contain secrets)
+.env
+.env.local
+.env.*.local
+
 # Logs
 logs
 *.log
@@ -7,22 +21,28 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
-
-# Environment files
-.env
-.env.local
-
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
+!.vscode/settings.json
 .idea
-.DS_Store
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Tool versions (optional - can be committed if you want)
+.tool-versions
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+
+# Project-specific
+*.local.md

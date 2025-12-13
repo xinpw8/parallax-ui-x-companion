@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron')
+const { app, BrowserWindow, ipcMain, clipboard, nativeImage, Menu } = require('electron')
 const path = require('path')
 
 let mainWindow
@@ -30,7 +30,10 @@ function createWindow() {
   }
 }
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  createWindow()
+  createMenu()
+})
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
@@ -78,3 +81,115 @@ Reply with ONLY the reply text, nothing else.`
     return null
   }
 })
+
+// Clipboard IPC handlers
+ipcMain.handle('clipboard-has-image', () => {
+  const image = clipboard.readImage()
+  const hasImage = !image.isEmpty()
+  console.log('[CLIPBOARD] hasImage:', hasImage, 'size:', image.getSize())
+  return hasImage
+})
+
+ipcMain.handle('clipboard-read-image', () => {
+  const image = clipboard.readImage()
+  if (image.isEmpty()) {
+    console.log('[CLIPBOARD] readImage: empty')
+    return null
+  }
+  const dataUrl = image.toDataURL()
+  console.log('[CLIPBOARD] readImage: got dataUrl, length:', dataUrl.length)
+  return dataUrl
+})
+
+ipcMain.handle('clipboard-read-text', () => {
+  return clipboard.readText()
+})
+
+ipcMain.handle('clipboard-write-image', (event, dataUrl) => {
+  try {
+    const image = nativeImage.createFromDataURL(dataUrl)
+    clipboard.writeImage(image)
+    return true
+  } catch (error) {
+    console.error('Error writing image to clipboard:', error)
+    return false
+  }
+})
+
+ipcMain.handle('clipboard-write-text', (event, text) => {
+  clipboard.writeText(text)
+  return true
+})
+
+// Set up application menu with Edit menu for clipboard operations
+function createMenu() {
+  const template = [
+    {
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        {
+          label: 'Paste',
+          accelerator: 'CmdOrCtrl+V',
+          click: () => {
+            if (mainWindow) {
+              mainWindow.webContents.send('trigger-paste')
+            }
+          }
+        },
+        { role: 'pasteAndMatchStyle' },
+        { role: 'delete' },
+        { type: 'separator' },
+        { role: 'selectAll' }
+      ]
+    },
+    {
+      label: 'View',
+      submenu: [
+        { role: 'reload' },
+        { role: 'forceReload' },
+        { role: 'toggleDevTools' },
+        { type: 'separator' },
+        { role: 'resetZoom' },
+        { role: 'zoomIn' },
+        { role: 'zoomOut' },
+        { type: 'separator' },
+        { role: 'togglefullscreen' }
+      ]
+    },
+    {
+      label: 'Window',
+      submenu: [
+        { role: 'minimize' },
+        { role: 'zoom' },
+        { role: 'close' }
+      ]
+    }
+  ]
+
+  // Add macOS-specific menu
+  if (process.platform === 'darwin') {
+    template.unshift({
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' }
+      ]
+    })
+  }
+
+  const menu = Menu.buildFromTemplate(template)
+  Menu.setApplicationMenu(menu)
+}
+

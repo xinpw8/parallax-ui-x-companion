@@ -1,6 +1,6 @@
 # Parallax X Companion
 
-AI-powered tweet reply generator for X/Twitter. Ctrl+hover over any tweet, pick a reply style, click to auto-post.
+Smart tweet reply generator for X/Twitter. Ctrl+hover over any tweet, pick a reply style, click to auto-post.
 
 ## How It Works
 
@@ -12,32 +12,50 @@ AI-powered tweet reply generator for X/Twitter. Ctrl+hover over any tweet, pick 
 ## Features
 
 - **4 Reply Styles** - laconic (terse), excited, flippant (sarcastic), supportive
-- **Anti-AI Detection** - no em dashes, no LLM-isms, all lowercase, natural tone
+- **Natural Tone** - no em dashes, all lowercase, sounds human
 - **Custom Prompts** - type adjustments like "more sarcastic" and regenerate
-- **Local-First** - uses Parallax on localhost:3001, falls back to Groq if unavailable
+- **Dual Backend Support** - use Groq API or your own Parallax backend
 - **One-Click Post** - click any reply to auto-insert and submit
 
 ## Quick Start
 
-### 1. Start Parallax (optional, will fall back to Groq)
-
-```bash
-parallax run -m Qwen/Qwen3-0.6B
-```
-
-### 2. Set up Groq fallback (optional)
+### 1. Configure API Backend
 
 ```bash
 cp .env.example .env
-# Edit .env and add your Groq API key
 ```
 
-### 3. Run the App
+Edit `.env` to configure your backend:
+
+**Option A: Groq API (default)**
+```env
+VITE_API_BACKEND=groq
+VITE_GROQ_API_KEY=your_groq_api_key_here
+```
+Get your API key at [console.groq.com](https://console.groq.com)
+
+**Option B: Parallax Backend**
+```env
+VITE_API_BACKEND=parallax
+VITE_PARALLAX_ENDPOINT=http://localhost:8000/v1/chat/completions
+VITE_PARALLAX_MODEL=default
+```
+
+### 2. Run the App
 
 ```bash
 npm install
 npm run electron:dev
 ```
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `VITE_API_BACKEND` | API backend to use: `groq` or `parallax` | `groq` |
+| `VITE_GROQ_API_KEY` | Groq API key (required for Groq backend) | - |
+| `VITE_PARALLAX_ENDPOINT` | Parallax API endpoint | `http://localhost:8000/v1/chat/completions` |
+| `VITE_PARALLAX_MODEL` | Model to use with Parallax backend | `default` |
 
 ## Tech Stack
 
@@ -45,3 +63,18 @@ npm run electron:dev
 - Tailwind CSS v4
 - Framer Motion
 - Vite
+- Groq API or Parallax Backend
+
+## Development
+
+```bash
+npm run dev              # Vite dev server only
+npm run electron:dev     # Full Electron + Vite dev
+npm run build            # Production build
+npm run lint             # ESLint
+```
+
+## Notes
+
+- Run on **Windows natively** for clipboard image paste support (WSL2 doesn't share image clipboard)
+- The app uses a persistent session (`persist:x`) so you stay logged into X
