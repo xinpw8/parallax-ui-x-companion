@@ -14,7 +14,7 @@ Smart tweet reply generator for X/Twitter. Ctrl+hover over any tweet, pick a rep
 - **4 Reply Styles** - laconic (terse), excited, flippant (sarcastic), supportive
 - **Natural Tone** - no em dashes, all lowercase, sounds human
 - **Custom Prompts** - type adjustments like "more sarcastic" and regenerate
-- **Dual Backend Support** - use Groq API or your own Parallax backend
+- **Dual Backend Support** - use Parallax backend or Groq API fallback
 - **One-Click Post** - click any reply to auto-insert and submit
 
 ## Quick Start

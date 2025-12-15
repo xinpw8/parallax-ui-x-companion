@@ -1,5 +1,55 @@
-const { app, BrowserWindow, ipcMain, clipboard, nativeImage, Menu } = require('electron')
+const { app, BrowserWindow, ipcMain, clipboard, nativeImage, Menu, session, webContents } = require('electron')
 const path = require('path')
+const fs = require('fs')
+
+// Increase EventEmitter limit to prevent MaxListenersExceededWarning
+require('events').EventEmitter.defaultMaxListeners = 50
+
+// Debug logging setup
+const DEBUG_LOG_DIR = path.join(__dirname, '..', 'debug_logs')
+const DEBUG_LOG_FILE = path.join(DEBUG_LOG_DIR, `electron_main_${new Date().toISOString().replace(/[:.]/g, '-')}.log`)
+
+// Ensure debug directory exists
+try {
+  if (!fs.existsSync(DEBUG_LOG_DIR)) {
+    fs.mkdirSync(DEBUG_LOG_DIR, { recursive: true })
+  }
+} catch (e) {
+  console.error('Failed to create debug_logs directory:', e)
+}
+
+function debugLog(...args) {
+  const timestamp = new Date().toISOString()
+  const message = `[${timestamp}] ${args.map(a => typeof a === 'object' ? JSON.stringify(a) : a).join(' ')}`
+  console.log(message)
+  try {
+    fs.appendFileSync(DEBUG_LOG_FILE, message + '\n')
+  } catch (e) {
+    // Ignore write errors
+  }
+}
+
+debugLog('[MAIN] Electron main process starting...')
+debugLog('[MAIN] Debug log file:', DEBUG_LOG_FILE)
+
+// GPU flags for video rendering in webviews on Windows
+// app.disableHardwareAcceleration() // Didn't work
+// app.commandLine.appendSwitch('disable-gpu-compositing') // Trying without this
+
+// Enable proprietary video codecs for video/GIF playback in webviews
+if (process.platform === 'win32') {
+  app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport,D3D11VideoDecoder,MediaFoundationD3D11VideoCapture')
+} else if (process.platform === 'linux') {
+  app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport,VaapiVideoDecodeLinuxGL')
+} else {
+  app.commandLine.appendSwitch('enable-features', 'PlatformHEVCDecoderSupport')
+}
+app.commandLine.appendSwitch('enable-accelerated-video-decode')
+app.commandLine.appendSwitch('enable-accelerated-video-encode')
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling')
+app.commandLine.appendSwitch('ignore-gpu-blocklist')
+app.commandLine.appendSwitch('enable-gpu-rasterization')
 
 let mainWindow
 
@@ -31,8 +81,30 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  debugLog('[MAIN] App ready')
+
+  // Set up permissions for the webview partition to allow media playback
+  const webviewSession = session.fromPartition('persist:x')
+  webviewSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    const allowedPermissions = ['media', 'mediaKeySystem', 'geolocation', 'notifications', 'fullscreen', 'pointerLock']
+    if (allowedPermissions.includes(permission)) {
+      callback(true)
+    } else {
+      debugLog('[PERMISSION] Denied:', permission)
+      callback(false)
+    }
+  })
+
+  // Also handle permission checks
+  webviewSession.setPermissionCheckHandler((webContents, permission) => {
+    const allowedPermissions = ['media', 'mediaKeySystem', 'geolocation', 'notifications', 'fullscreen', 'pointerLock']
+    return allowedPermissions.includes(permission)
+  })
+
   createWindow()
   createMenu()
+
+  debugLog('[MAIN] Window and menu created')
 })
 
 app.on('window-all-closed', () => {
@@ -42,6 +114,7 @@ app.on('window-all-closed', () => {
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow()
 })
+
 
 // Handle API calls from renderer
 ipcMain.handle('analyze-tweet', async (event, tweetText, apiEndpoint) => {
@@ -119,6 +192,17 @@ ipcMain.handle('clipboard-write-image', (event, dataUrl) => {
 ipcMain.handle('clipboard-write-text', (event, text) => {
   clipboard.writeText(text)
   return true
+})
+
+// Debug log handler from renderer
+ipcMain.handle('debug-log', (event, message) => {
+  debugLog('[RENDERER]', message)
+  return true
+})
+
+// Get debug log path
+ipcMain.handle('get-debug-log-path', () => {
+  return DEBUG_LOG_FILE
 })
 
 // Set up application menu with Edit menu for clipboard operations

@@ -11,6 +11,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   clipboardWriteImage: (dataUrl) => ipcRenderer.invoke('clipboard-write-image', dataUrl),
   clipboardWriteText: (text) => ipcRenderer.invoke('clipboard-write-text', text),
 
+  // Debug logging to file
+  debugLog: (message) => ipcRenderer.invoke('debug-log', message),
+  getDebugLogPath: () => ipcRenderer.invoke('get-debug-log-path'),
+
   // Logging
   logToMain: (message) => console.log('[PRELOAD]', message),
 

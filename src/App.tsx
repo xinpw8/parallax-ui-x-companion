@@ -47,12 +47,15 @@ const REPLY_STYLES = [
 
 const STYLE_RULES = `
 CRITICAL RULES - VIOLATIONS WILL BE REJECTED:
+- NEVER use emojis under any circumstances
 - NEVER use em dashes (—) under any circumstances
 - NEVER ask questions to "elicit engagement" or prompt responses
 - NEVER use phrases like "this is so", "I love this", "absolutely", "literally"
 - NEVER say "atcha", "gotcha", "ya", "get it", or other LLM-isms
 - NEVER start with "I"
 - NEVER use corporate speak or buzzwords
+- Your reply MUST reference specific content from the tweet (names, topics, claims, etc)
+- Generic replies that could apply to any tweet are FORBIDDEN
 - Sound like a real human typing quickly on their phone
 - Use casual internet spelling/grammar when natural
 - Can use "lol", "lmao", "ngl", "tbh" sparingly if it fits
@@ -67,14 +70,26 @@ function App() {
     const [isOverPanel, setIsOverPanel] = useState(false)
     const [customPrompt, setCustomPrompt] = useState('')
     const [isRegenerating, setIsRegenerating] = useState(false)
+    const [currentUrl, setCurrentUrl] = useState('https://x.com/home')
+    const [urlInput, setUrlInput] = useState('https://x.com/home')
+    const [postPanelUrl, setPostPanelUrl] = useState<string | null>(null)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const webviewRef = useRef<any>(null)
-    const webviewInitializedRef = useRef(false)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const postWebviewRef = useRef<any>(null)
+    // Track which webview has the active hover ('main' or 'post')
+    const activeHoverWebviewRef = useRef<'main' | 'post'>('main')
+    // Track if post panel webview is ready
+    const postWebviewReadyRef = useRef(false)
+    // Track if post panel listeners are set up
+    const postListenersSetupRef = useRef(false)
     const generatingForRef = useRef<string | null>(null)
     const lastTextRef = useRef<string | null>(null)
     const ctrlPressedRef = useRef(false)
     const isOverPanelRef = useRef(false)
     const hoveredTweetRef = useRef<HoveredTweet | null>(null)
+    const currentUrlRef = useRef('https://x.com/home')
+    const postPanelUrlRef = useRef<string | null>(null)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const generateRepliesRef = useRef<any>(null)
     const webviewReadyRef = useRef(false)
@@ -83,6 +98,8 @@ function App() {
     isOverPanelRef.current = isOverPanel
     hoveredTweetRef.current = hoveredTweet
     webviewReadyRef.current = webviewReady
+    currentUrlRef.current = currentUrl
+    postPanelUrlRef.current = postPanelUrl
 
     const generateReplies = useCallback(async (tweetText: string, extraInstruction?: string) => {
         const cacheKey = tweetText + (extraInstruction || '')
@@ -197,11 +214,195 @@ Write ONLY the reply text, nothing else:`
 
     // Handle clipboard request from webview console messages
     const handleConsoleMessage = useCallback(async (event: any) => {
-        const message = event.message
-        // Log all webview console messages for debugging
-        if (message && (message.startsWith('[CLIPBOARD') || message.startsWith('[PASTE'))) {
-            console.log('[RENDERER] Webview console:', message)
+        // Debug: log the entire event to understand its structure
+        console.log('[CONSOLE-MSG] Event received, level:', event.level, 'line:', event.line)
+        console.log('[CONSOLE-MSG] Message:', event.message)
+
+        // Also write to file for persistence
+        const electronAPI = (window as any).electronAPI
+        if (electronAPI?.debugLog) {
+            electronAPI.debugLog(`[WEBVIEW] ${event.message}`)
         }
+
+        const message = event.message
+
+        // Handle split view requests from webview
+        if (message && message.startsWith('[SPLIT_VIEW_REQUEST]')) {
+            console.log('[RENDERER] Got split view request from webview')
+            try {
+                const jsonStr = message.replace('[SPLIT_VIEW_REQUEST]', '').trim()
+                const request = JSON.parse(jsonStr)
+                if (request.url) {
+                    console.log('[RENDERER] Opening in split panel:', request.url)
+
+                    // Check if this is the same URL already open
+                    const isSameUrl = postPanelUrlRef.current === request.url
+                    console.log('[RENDERER] isSameUrl:', isSameUrl, 'current:', postPanelUrlRef.current)
+
+                    // Save scroll position before opening split (resize can cause scroll jump)
+                    const mainWebview = webviewRef.current
+                    if (mainWebview) {
+                        mainWebview.executeJavaScript(`
+                            (function() {
+                                const scrollY = window.scrollY;
+                                console.log('[SPLIT] Saving scroll before split open:', scrollY);
+                                window.__preSplitScroll = scrollY;
+                            })();
+                        `).catch(() => {})
+                    }
+
+                    // Reset post panel ready state so it re-injects on new URL
+                    if (!isSameUrl) {
+                        postWebviewReadyRef.current = false
+                    }
+
+                    // Always set URL (even if same, to ensure state is correct)
+                    setPostPanelUrl(request.url)
+
+                    // Restore scroll position after split opens
+                    setTimeout(() => {
+                        if (mainWebview) {
+                            mainWebview.executeJavaScript(`
+                                (function() {
+                                    if (typeof window.__preSplitScroll === 'number') {
+                                        console.log('[SPLIT] Restoring scroll after split open:', window.__preSplitScroll);
+                                        window.scrollTo(0, window.__preSplitScroll);
+                                        delete window.__preSplitScroll;
+                                    }
+                                })();
+                            `).catch(() => {})
+                        }
+                    }, 300)
+
+                    // Aggressive focus sequence for post panel composer
+                    const focusComposer = (attempt: number) => {
+                        const postWv = postWebviewRef.current
+                        if (!postWv) {
+                            console.log('[SPLIT] No postWebviewRef, aborting focus')
+                            return
+                        }
+                        if (attempt > 15) {
+                            console.log('[SPLIT] Max focus attempts reached')
+                            return
+                        }
+
+                        const debugLog = (msg: string) => {
+                            console.log(msg)
+                            ;(window as any).electronAPI?.debugLog?.(msg)
+                        }
+                        debugLog('[SPLIT] Focus attempt ' + attempt)
+
+                        // First focus the webview element itself
+                        postWv.focus()
+
+                        // Then execute JS to find the composer and get its coordinates
+                        postWv.executeJavaScript(`
+                            (async function() {
+                                // Helper to simulate real mouse click (needed for DraftJS editors)
+                                const simulateClick = (el) => {
+                                    const rect = el.getBoundingClientRect();
+                                    const x = rect.left + rect.width / 2;
+                                    const y = rect.top + rect.height / 2;
+                                    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+                                    el.dispatchEvent(new MouseEvent('mousedown', opts));
+                                    el.dispatchEvent(new MouseEvent('mouseup', opts));
+                                    el.dispatchEvent(new MouseEvent('click', opts));
+                                };
+
+                                // First, try to click the reply placeholder to expand the composer
+                                // X shows a collapsed "Post your reply" area that needs to be clicked
+                                const replyPlaceholders = [
+                                    '[data-testid="tweetTextarea_0RichTextInputContainer"]',
+                                    '[data-testid="toolBar"] ~ div [role="textbox"]',
+                                    '[placeholder="Post your reply"]',
+                                    '[aria-label="Post your reply"]',
+                                    '[data-text="true"]'
+                                ];
+                                let clickedPlaceholder = false;
+                                for (const sel of replyPlaceholders) {
+                                    const placeholder = document.querySelector(sel);
+                                    if (placeholder) {
+                                        console.log('[SPLIT-FOCUS] Scrolling and clicking reply placeholder:', sel);
+                                        placeholder.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                        await new Promise(r => setTimeout(r, 50));
+                                        simulateClick(placeholder);
+                                        clickedPlaceholder = true;
+                                        break;
+                                    }
+                                }
+
+                                // Wait for composer to appear after clicking placeholder
+                                if (clickedPlaceholder) {
+                                    await new Promise(r => setTimeout(r, 200));
+                                }
+
+                                // Now try to find the actual composer and return its coordinates
+                                const selectors = [
+                                    '[data-testid="tweetTextarea_0"]',
+                                    '[data-testid="tweetTextarea_0_label"]',
+                                    '[role="textbox"][data-testid]',
+                                    '.public-DraftEditor-content',
+                                    '[contenteditable="true"]'
+                                ];
+                                for (const sel of selectors) {
+                                    const el = document.querySelector(sel);
+                                    if (el) {
+                                        // Scroll into view first to ensure visibility even if large image takes space
+                                        el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                        await new Promise(r => setTimeout(r, 100));
+                                        const rect = el.getBoundingClientRect();
+                                        const x = Math.round(rect.left + rect.width / 2);
+                                        const y = Math.round(rect.top + rect.height / 2);
+                                        console.log('[SPLIT-FOCUS] Found composer at:', x, y, sel);
+                                        // Also do DOM focus as backup
+                                        simulateClick(el);
+                                        el.focus();
+                                        return { found: true, x, y, selector: sel };
+                                    }
+                                }
+                                console.log('[SPLIT-FOCUS] No composer found yet');
+                                return { found: false, x: 0, y: 0, selector: null };
+                            })()
+                        `).then((result: { found: boolean, x: number, y: number, selector: string | null }) => {
+                            debugLog('[SPLIT] Focus result: ' + result.found + ' at ' + result.x + ',' + result.y)
+                            if (!result.found && attempt < 15) {
+                                // Retry after delay
+                                setTimeout(() => focusComposer(attempt + 1), 400)
+                            } else if (result.found) {
+                                // Use Electron's sendInputEvent for REAL mouse click
+                                // This bypasses DOM and goes through Chromium's input pipeline
+                                debugLog('[SPLIT] Sending real input event at ' + result.x + ',' + result.y)
+                                try {
+                                    // Send mousedown, mouseup, click sequence
+                                    postWv.sendInputEvent({ type: 'mouseDown', x: result.x, y: result.y, button: 'left', clickCount: 1 })
+                                    postWv.sendInputEvent({ type: 'mouseUp', x: result.x, y: result.y, button: 'left', clickCount: 1 })
+                                    debugLog('[SPLIT] Real input events sent successfully')
+                                } catch (e) {
+                                    debugLog('[SPLIT] sendInputEvent error: ' + e)
+                                }
+                                // Also focus the webview element
+                                postWv.focus()
+                            }
+                        }).catch((err: unknown) => {
+                            debugLog('[SPLIT] Focus error: ' + err)
+                            if (attempt < 15) {
+                                setTimeout(() => focusComposer(attempt + 1), 400)
+                            }
+                        })
+                    }
+
+                    // If same URL, focus immediately (page already loaded)
+                    // If new URL, wait for page to load first
+                    const focusDelay = isSameUrl ? 100 : 1000
+                    console.log('[RENDERER] Scheduling focus with delay:', focusDelay)
+                    setTimeout(() => focusComposer(1), focusDelay)
+                }
+            } catch (err) {
+                console.error('[SPLIT] Error parsing request:', err)
+            }
+            return
+        }
+
         if (message && message.startsWith('[CLIPBOARD_REQUEST]')) {
             console.log('[RENDERER] Got clipboard request from webview')
             try {
@@ -258,43 +459,560 @@ Write ONLY the reply text, nothing else:`
         }
     }, [])
 
+    // Track if we've set up listeners (to avoid duplicates)
+    const listenersSetupRef = useRef(false)
+    // Track if CSS has been injected (to avoid duplicate injection)
+    const cssInjectedRef = useRef(false)
+    // Store listener references for cleanup
+    const listenersRef = useRef<{
+        domReady?: () => void
+        consoleMessage?: (e: any) => void
+        didNavigate?: (e: any) => void
+        didNavigateInPage?: (e: any) => void
+    }>({})
+
     // Callback ref for webview - triggers when element is mounted
     const webviewCallbackRef = useCallback((webview: any) => {
         console.log('[REF] Webview callback ref called:', !!webview)
+
+        // Cleanup old listeners if webview changed
+        if (webviewRef.current && webviewRef.current !== webview && listenersSetupRef.current) {
+            console.log('[REF] Cleaning up old listeners...')
+            const oldWebview = webviewRef.current
+            const listeners = listenersRef.current
+            if (listeners.domReady) oldWebview.removeEventListener('dom-ready', listeners.domReady)
+            if (listeners.consoleMessage) oldWebview.removeEventListener('console-message', listeners.consoleMessage)
+            if (listeners.didNavigate) oldWebview.removeEventListener('did-navigate', listeners.didNavigate)
+            if (listeners.didNavigateInPage) oldWebview.removeEventListener('did-navigate-in-page', listeners.didNavigateInPage)
+            if (listeners.willNavigate) oldWebview.removeEventListener('will-navigate', listeners.willNavigate)
+            listenersSetupRef.current = false
+            cssInjectedRef.current = false
+        }
+
         webviewRef.current = webview
-        if (webview && !webviewInitializedRef.current) {
-            console.log('[REF] Setting up webview initialization...')
-            // Set up dom-ready listener
+
+        // Set up listeners for new webview
+        if (webview && !listenersSetupRef.current) {
+            console.log('[REF] Setting up webview listeners...')
+            listenersSetupRef.current = true
+
+            // Set max listeners immediately to prevent warning
+            try {
+                 if (webview.setMaxListeners) {
+                     webview.setMaxListeners(50)
+                 }
+            } catch { /* ignore */ }
+
+            // Create listener functions
             const handleDomReady = () => {
-                console.log('[REF] dom-ready fired!')
-                initializeWebview(webview)
-            }
-            webview.addEventListener('dom-ready', handleDomReady)
-
-            // Set up console-message listener for clipboard requests
-            webview.addEventListener('console-message', handleConsoleMessage)
-
-            // Also check if already loaded
-            setTimeout(() => {
-                if (!webviewInitializedRef.current && webview.getURL && webview.getURL()) {
-                    console.log('[REF] Webview already has URL, initializing now')
-                    initializeWebview(webview)
+                console.log('[REF] dom-ready fired, injecting helpers...')
+                // Increase max listeners on webview's webContents to prevent warning
+                try {
+                    const wc = webview.getWebContents?.()
+                    if (wc) {
+                        if (wc.setMaxListeners) {
+                            wc.setMaxListeners(50)
+                        }
+                        // Also attach console-message listener to webContents as fallback
+                        wc.on('console-message', (_event: any, level: number, message: string, line: number, sourceId: string) => {
+                            console.log('[WC-CONSOLE]', { level, message, line, sourceId })
+                            // Also call our handler
+                            handleConsoleMessage({ level, message, line, sourceId })
+                        })
+                        console.log('[REF] Attached console-message listener to webContents')
+                    }
+                } catch (e) {
+                    console.log('[REF] Failed to access webContents:', e)
                 }
-            }, 100)
+                injectHelpers(webview)
+            }
+
+            const handleDidNavigate = (e: any) => {
+                console.log('[NAV] did-navigate:', e.url)
+                setUrlInput(e.url)
+                setCurrentUrl(e.url)
+            }
+
+            const handleDidNavigateInPage = (e: any) => {
+                console.log('[NAV] did-navigate-in-page:', e.url)
+                setUrlInput(e.url)
+                setCurrentUrl(e.url)
+            }
+
+            // Intercept navigation to open posts in split panel
+            const handleWillNavigate = (e: any) => {
+                const targetUrl = e.url
+                const currentPath = currentUrlRef.current
+                console.log('[NAV] will-navigate:', targetUrl, 'from:', currentPath)
+
+                // Check if navigating to a post URL (pattern: /username/status/id)
+                const isPostUrl = /\/[^/]+\/status\/\d+/.test(targetUrl) && !targetUrl.includes('/photo/')
+                // Only intercept if we're on notifications, home, or a list
+                const shouldIntercept = /\/(notifications|home)/.test(currentPath) || /\/i\/lists\//.test(currentPath)
+
+                if (isPostUrl && shouldIntercept) {
+                    console.log('[NAV] Intercepting post navigation, opening in panel')
+                    e.preventDefault()
+                    setPostPanelUrl(targetUrl)
+                    return
+                }
+            }
+
+            // Store references for cleanup
+            listenersRef.current = {
+                domReady: handleDomReady,
+                consoleMessage: handleConsoleMessage,
+                didNavigate: handleDidNavigate,
+                didNavigateInPage: handleDidNavigateInPage,
+                willNavigate: handleWillNavigate
+            }
+
+            // Add listeners
+            webview.addEventListener('dom-ready', handleDomReady)
+            webview.addEventListener('console-message', handleConsoleMessage)
+            webview.addEventListener('did-navigate', handleDidNavigate)
+            webview.addEventListener('did-navigate-in-page', handleDidNavigateInPage)
+            webview.addEventListener('will-navigate', handleWillNavigate)
+
+            console.log('[LISTENER] All listeners added to webview')
+
+            // Test if console-message listener works
+            setTimeout(() => {
+                if (webview && webview.executeJavaScript) {
+                    console.log('[TEST] Sending test console.log to webview...')
+                    webview.executeJavaScript(`console.log('[TEST] Hello from webview - if you see this in CONSOLE-MSG, console-message works!')`)
+                        .then(() => console.log('[TEST] Test script executed'))
+                        .catch((err: any) => console.log('[TEST] Test script failed:', err))
+                }
+            }, 1000)
         }
     }, [handleConsoleMessage])
 
-    // Webview initialization function
-    const initializeWebview = useCallback((webview: any) => {
-        if (webviewInitializedRef.current) {
-            console.log('[INIT] Already initialized, skipping')
-            return
+    // Callback ref for post panel webview - triggers when element is mounted
+    const postWebviewCallbackRef = useCallback((webview: any) => {
+        const debugLog = (msg: string) => {
+            console.log(msg)
+            ;(window as any).electronAPI?.debugLog?.(msg)
         }
-        console.log('[INIT] Initializing webview...')
-        webviewInitializedRef.current = true
+        debugLog('[POST-PANEL-REF] Post webview callback ref called: ' + !!webview)
 
-        // Inject CSS
-        webview.insertCSS(`
+        // Cleanup old listeners if webview changed or unmounted
+        if (postWebviewRef.current && postWebviewRef.current !== webview && postListenersSetupRef.current) {
+            debugLog('[POST-PANEL-REF] Cleaning up old listeners...')
+            const oldWebview = postWebviewRef.current
+            try {
+                oldWebview.removeEventListener('dom-ready', oldWebview._postPanelDomReady)
+                oldWebview.removeEventListener('did-navigate-in-page', oldWebview._postPanelInPageNav)
+            } catch { /* ignore */ }
+            postListenersSetupRef.current = false
+            postWebviewReadyRef.current = false
+        }
+
+        postWebviewRef.current = webview
+
+        // Set up listeners for new webview
+        if (webview && !postListenersSetupRef.current) {
+            debugLog('[POST-PANEL-REF] Setting up post panel listeners...')
+            postListenersSetupRef.current = true
+
+            const handleDomReady = () => {
+                // Guard against multiple calls
+                if (postWebviewReadyRef.current) {
+                    debugLog('[POST-PANEL] Already injected, skipping...')
+                    return
+                }
+                debugLog('[POST-PANEL] dom-ready fired, injecting helpers...')
+                postWebviewReadyRef.current = true
+
+                // Inject CSS
+                webview.insertCSS(`
+                    /* Hide sidebar in post panel */
+                    [data-testid="sidebarColumn"] { display: none !important; }
+                    [data-testid="primaryColumn"] {
+                        max-width: 100% !important;
+                        width: 100% !important;
+                        border-right: none !important;
+                    }
+                    /* Force GPU compositing for video */
+                    video {
+                        will-change: transform !important;
+                        transform: translateZ(0) !important;
+                    }
+                    /* Hover highlight */
+                    .parallax-hover {
+                        background: rgba(29, 155, 240, 0.15) !important;
+                        outline: 2px solid rgba(29, 155, 240, 0.6) !important;
+                        outline-offset: -2px;
+                        border-radius: 12px;
+                    }
+                `).catch((err: unknown) => console.log('[POST-PANEL] CSS error:', err))
+
+                // Inject JS for hover tracking, reply insertion, and auto-focus
+                webview.executeJavaScript(`
+                    (function() {
+                        if (window.parallaxPostPanelReady) {
+                            console.log('[POST-PANEL] Already initialized, skipping');
+                            return;
+                        }
+                        console.log('[POST-PANEL] Initializing helpers...');
+
+                        window.isCtrlPressed = false;
+                        window.hoveredTweetText = null;
+                        window.currentHoveredArticle = null;
+                        window.lastMouseX = 0;
+                        window.lastMouseY = 0;
+                        window.targetArticle = null;
+
+                        // Update highlight on hovered article
+                        window.updateHighlight = function() {
+                            document.querySelectorAll('.parallax-hover').forEach(el => el.classList.remove('parallax-hover'));
+                            if (window.isCtrlPressed && window.targetArticle) {
+                                window.targetArticle.classList.add('parallax-hover');
+                            }
+                        };
+
+                        // Mouse move tracking - CLEAR text when not over an article
+                        document.addEventListener('mousemove', (e) => {
+                            window.lastMouseX = e.clientX;
+                            window.lastMouseY = e.clientY;
+
+                            const article = e.target.closest('article[data-testid="tweet"]');
+                            if (article) {
+                                const textEl = article.querySelector('[data-testid="tweetText"]');
+                                if (textEl) {
+                                    const text = textEl.innerText.trim();
+                                    if (text && text.length >= 5) {
+                                        window.hoveredTweetText = text;
+                                        window.targetArticle = article;
+                                    }
+                                }
+                            } else {
+                                // IMPORTANT: Clear hover text when mouse is NOT over an article
+                                window.hoveredTweetText = null;
+                                window.targetArticle = null;
+                            }
+                            window.updateHighlight();
+                        });
+
+                        // Ctrl key tracking - only LEFT Ctrl for AI popup
+                        document.addEventListener('keydown', (e) => {
+                            if (e.key === 'Control' && e.location === 1) {
+                                window.isCtrlPressed = true;
+                                window.updateHighlight();
+                            }
+                        });
+                        document.addEventListener('keyup', (e) => {
+                            if (e.key === 'Control' && e.location === 1) {
+                                window.isCtrlPressed = false;
+                                window.updateHighlight();
+                            }
+                        });
+                        window.addEventListener('blur', () => {
+                            window.isCtrlPressed = false;
+                            window.updateHighlight();
+                        });
+
+                        // Reply insertion function with clear and auto-submit
+                        window.insertReply = function(text) {
+                            console.log('[POST-PANEL] insertReply called with:', text?.slice(0, 50));
+                            const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
+                            if (composer) {
+                                composer.focus();
+
+                                // Clear existing content first by selecting all and deleting
+                                document.execCommand('selectAll', false, null);
+                                document.execCommand('delete', false, null);
+
+                                // Insert new text via paste
+                                const dataTransfer = new DataTransfer();
+                                dataTransfer.setData('text/plain', text);
+                                const pasteEvent = new ClipboardEvent('paste', {
+                                    bubbles: true,
+                                    cancelable: true,
+                                    clipboardData: dataTransfer
+                                });
+                                composer.dispatchEvent(pasteEvent);
+                                console.log('[POST-PANEL] Reply inserted via paste event');
+
+                                // Auto-submit after a short delay (wait for button to become enabled)
+                                const trySubmit = (attempts) => {
+                                    const replyButton = document.querySelector('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]');
+                                    console.log('[POST-PANEL] Submit attempt', attempts, 'button:', !!replyButton, 'disabled:', replyButton?.disabled);
+                                    if (replyButton && !replyButton.disabled) {
+                                        console.log('[POST-PANEL] Clicking reply button...');
+                                        replyButton.click();
+                                    } else if (attempts < 10) {
+                                        // Button might not be enabled yet, retry
+                                        setTimeout(() => trySubmit(attempts + 1), 200);
+                                    } else {
+                                        console.log('[POST-PANEL] Reply button not found or stayed disabled after retries');
+                                    }
+                                };
+                                setTimeout(() => trySubmit(0), 300);
+                            } else {
+                                console.log('[POST-PANEL] No composer found for reply insertion');
+                            }
+                        };
+
+                        window.parallaxPostPanelReady = true;
+                        console.log('[POST-PANEL] Helpers initialized!');
+
+                        // Helper to simulate real mouse click (needed for DraftJS editors)
+                        const simulateClick = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const x = rect.left + rect.width / 2;
+                            const y = rect.top + rect.height / 2;
+                            const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+                            el.dispatchEvent(new MouseEvent('mousedown', opts));
+                            el.dispatchEvent(new MouseEvent('mouseup', opts));
+                            el.dispatchEvent(new MouseEvent('click', opts));
+                        };
+
+                        // Auto-focus composer after a short delay
+                        let focusAttempts = 0;
+                        const tryFocus = async () => {
+                            focusAttempts++;
+                            console.log('[POST-PANEL] Focus attempt', focusAttempts);
+
+                            // First, try to click the reply placeholder to expand the composer
+                            // X shows a collapsed "Post your reply" area that needs to be clicked
+                            const replyPlaceholders = [
+                                '[data-testid="tweetTextarea_0RichTextInputContainer"]',
+                                '[data-testid="toolBar"] ~ div [role="textbox"]',
+                                '[placeholder="Post your reply"]',
+                                '[aria-label="Post your reply"]',
+                                '[data-text="true"]'
+                            ];
+                            let clickedPlaceholder = false;
+                            for (const sel of replyPlaceholders) {
+                                const placeholder = document.querySelector(sel);
+                                if (placeholder) {
+                                    console.log('[POST-PANEL] Scrolling and clicking reply placeholder:', sel);
+                                    placeholder.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                    await new Promise(r => setTimeout(r, 50));
+                                    simulateClick(placeholder);
+                                    clickedPlaceholder = true;
+                                    break;
+                                }
+                            }
+
+                            // Wait for composer to appear after clicking placeholder
+                            if (clickedPlaceholder) {
+                                await new Promise(r => setTimeout(r, 200));
+                            }
+
+                            // Try multiple selectors for the composer
+                            const selectors = [
+                                '[data-testid="tweetTextarea_0"]',
+                                '[data-testid="tweetTextarea_0_label"]',
+                                '[role="textbox"][data-testid]',
+                                '.public-DraftEditor-content',
+                                '[contenteditable="true"]'
+                            ];
+
+                            let composer = null;
+                            for (const sel of selectors) {
+                                composer = document.querySelector(sel);
+                                if (composer) {
+                                    console.log('[POST-PANEL] Found composer with selector:', sel);
+                                    break;
+                                }
+                            }
+
+                            if (composer) {
+                                console.log('[POST-PANEL] Scrolling composer into view and focusing...');
+                                composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                // Small delay after scroll to ensure it's visible
+                                await new Promise(r => setTimeout(r, 100));
+                                simulateClick(composer);
+                                composer.focus();
+                                console.log('[POST-PANEL] Focused composer!');
+                            } else if (focusAttempts < 20) {
+                                console.log('[POST-PANEL] Composer not found, retrying...');
+                                setTimeout(tryFocus, 300);
+                            } else {
+                                console.log('[POST-PANEL] Gave up finding composer after', focusAttempts, 'attempts');
+                            }
+                        };
+                        setTimeout(tryFocus, 800);
+
+                        // Add click listener on posts to focus reply field
+                        document.addEventListener('click', async (e) => {
+                            const article = e.target.closest('article[data-testid="tweet"]');
+                            // Only proceed if clicking on a post article
+                            if (!article) return;
+
+                            // Don't interfere if clicking on interactive elements (links, buttons, etc)
+                            const interactiveEl = e.target.closest('a, button, [role="button"], [data-testid="like"], [data-testid="retweet"], [data-testid="reply"], [role="textbox"], [contenteditable="true"]');
+                            if (interactiveEl) return;
+
+                            console.log('[POST-PANEL] Click on post detected, focusing reply...');
+
+                            // Short delay to let any other handlers run first
+                            await new Promise(r => setTimeout(r, 100));
+
+                            // Find and focus the composer
+                            const selectors = [
+                                '[data-testid="tweetTextarea_0"]',
+                                '[role="textbox"][data-testid]',
+                                '.public-DraftEditor-content',
+                                '[contenteditable="true"]'
+                            ];
+
+                            for (const sel of selectors) {
+                                const composer = document.querySelector(sel);
+                                if (composer) {
+                                    console.log('[POST-PANEL] Click: Scrolling and focusing composer');
+                                    composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                    await new Promise(r => setTimeout(r, 50));
+                                    simulateClick(composer);
+                                    composer.focus();
+                                    break;
+                                }
+                            }
+                        }, true); // Use capture phase
+                    })();
+                `).then(() => {
+                    debugLog('[POST-PANEL] JS injection complete!')
+                }).catch((err: unknown) => debugLog('[POST-PANEL] JS error: ' + err))
+            }
+
+            // Store reference for cleanup
+            webview._postPanelDomReady = handleDomReady
+            webview.addEventListener('dom-ready', handleDomReady)
+            // Also listen to did-finish-load as backup
+            webview.addEventListener('did-finish-load', handleDomReady)
+
+            // Add console-message listener to see logs from post panel
+            webview.addEventListener('console-message', (e: any) => {
+                if (e.message?.includes('[POST-PANEL]') || e.message?.includes('[SPLIT-FOCUS]')) {
+                    console.log('[POST-PANEL-CONSOLE]', e.message)
+                    ;(window as any).electronAPI?.debugLog?.('[POST-PANEL-CONSOLE] ' + e.message)
+                }
+            })
+
+            // Add did-navigate-in-page listener to re-trigger focus on SPA navigation
+            const handleInPageNavigation = (e: any) => {
+                const url = e.url || ''
+                debugLog('[POST-PANEL] In-page navigation to: ' + url)
+                // Check if navigating to a post page (has /status/ in URL)
+                if (url.includes('/status/')) {
+                    debugLog('[POST-PANEL] Detected post navigation, re-triggering focus...')
+                    // Re-trigger the focus logic after a delay for page to render
+                    webview.executeJavaScript(`
+                        (async function() {
+                            console.log('[POST-PANEL] Re-triggering focus after navigation...');
+
+                            const simulateClick = (el) => {
+                                const rect = el.getBoundingClientRect();
+                                const x = rect.left + rect.width / 2;
+                                const y = rect.top + rect.height / 2;
+                                const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+                                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                                el.dispatchEvent(new MouseEvent('click', opts));
+                            };
+
+                            let focusAttempts = 0;
+                            const tryFocusNav = async () => {
+                                focusAttempts++;
+                                console.log('[POST-PANEL] Navigation focus attempt', focusAttempts);
+
+                                // First, try to click the reply placeholder to expand the composer
+                                const replyPlaceholders = [
+                                    '[data-testid="tweetTextarea_0RichTextInputContainer"]',
+                                    '[data-testid="toolBar"] ~ div [role="textbox"]',
+                                    '[placeholder="Post your reply"]',
+                                    '[aria-label="Post your reply"]',
+                                    '[data-text="true"]'
+                                ];
+                                let clickedPlaceholder = false;
+                                for (const sel of replyPlaceholders) {
+                                    const placeholder = document.querySelector(sel);
+                                    if (placeholder) {
+                                        console.log('[POST-PANEL] Nav: Scrolling and clicking placeholder:', sel);
+                                        placeholder.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                        await new Promise(r => setTimeout(r, 50));
+                                        simulateClick(placeholder);
+                                        clickedPlaceholder = true;
+                                        break;
+                                    }
+                                }
+
+                                if (clickedPlaceholder) {
+                                    await new Promise(r => setTimeout(r, 200));
+                                }
+
+                                // Now find and focus the composer
+                                const selectors = [
+                                    '[data-testid="tweetTextarea_0"]',
+                                    '[data-testid="tweetTextarea_0_label"]',
+                                    '[role="textbox"][data-testid]',
+                                    '.public-DraftEditor-content',
+                                    '[contenteditable="true"]'
+                                ];
+
+                                let composer = null;
+                                for (const sel of selectors) {
+                                    composer = document.querySelector(sel);
+                                    if (composer) {
+                                        console.log('[POST-PANEL] Nav: Found composer:', sel);
+                                        break;
+                                    }
+                                }
+
+                                if (composer) {
+                                    console.log('[POST-PANEL] Nav: Scrolling and focusing composer...');
+                                    composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+                                    await new Promise(r => setTimeout(r, 100));
+                                    simulateClick(composer);
+                                    composer.focus();
+                                    console.log('[POST-PANEL] Nav: Focused composer!');
+                                } else if (focusAttempts < 15) {
+                                    console.log('[POST-PANEL] Nav: Composer not found, retrying...');
+                                    setTimeout(tryFocusNav, 300);
+                                } else {
+                                    console.log('[POST-PANEL] Nav: Gave up finding composer');
+                                }
+                            };
+
+                            // Start trying after delay for page to load
+                            setTimeout(tryFocusNav, 500);
+                        })();
+                    `).catch((err: unknown) => debugLog('[POST-PANEL] Nav focus error: ' + err))
+                }
+            }
+            webview.addEventListener('did-navigate-in-page', handleInPageNavigation)
+            webview._postPanelInPageNav = handleInPageNavigation
+
+            debugLog('[POST-PANEL-REF] dom-ready and navigation listeners added')
+
+            // Also trigger after a delay as fallback (in case dom-ready already fired)
+            setTimeout(() => {
+                if (!postWebviewReadyRef.current && webview) {
+                    debugLog('[POST-PANEL-REF] Fallback trigger - calling handleDomReady')
+                    handleDomReady()
+                }
+            }, 500)
+        }
+
+        // Handle unmount - reset refs
+        if (!webview) {
+            postListenersSetupRef.current = false
+            postWebviewReadyRef.current = false
+        }
+    }, [])
+
+    // Inject CSS and JS helpers
+    const injectHelpers = useCallback((webview: any) => {
+        console.log('[INJECT] Injecting helpers...')
+
+        // Only inject CSS once per webview instance to avoid accumulation
+        if (!cssInjectedRef.current) {
+            console.log('[INJECT] Injecting CSS (first time)...')
+            cssInjectedRef.current = true
+            webview.insertCSS(`
+      #placeholder { display: none !important; }
       [data-testid="sidebarColumn"] { display: none !important; }
       [aria-label="Timeline: Trending now"] { display: none !important; }
       [aria-label="Who to follow"] { display: none !important; }
@@ -304,15 +1022,12 @@ Write ONLY the reply text, nothing else:`
         border-right: none !important;
       }
       [data-testid="placementTracking"] { display: none !important; }
-
       .parallax-hover {
         background: rgba(29, 155, 240, 0.15) !important;
         outline: 2px solid rgba(29, 155, 240, 0.6) !important;
         outline-offset: -2px;
         border-radius: 12px;
       }
-
-      /* When chat expand mode is active, disable virtualization */
       body.parallax-chat-expand [data-testid="DmScrollerContainer"] {
         height: auto !important;
         max-height: none !important;
@@ -324,12 +1039,366 @@ Write ONLY the reply text, nothing else:`
         overflow: visible !important;
         transform: none !important;
       }
-    `)
+      /* Force GPU compositing layer for video rendering in webviews */
+      video {
+        will-change: transform !important;
+        transform: translateZ(0) !important;
+        -webkit-transform: translateZ(0) !important;
+      }
+    `).catch((err: unknown) => console.log('[INJECT] CSS injection error:', err))
+        }
 
         // Inject JavaScript
         webview.executeJavaScript(`
       (function() {
-        console.log('[WEBVIEW] Initializing Parallax helper...');
+        console.log('[WEBVIEW] Parallax helper injection running...');
+
+        // === SCROLL POSITION & AUTO-FOCUS (always runs) ===
+        // These need to run on every navigation, not just first init
+
+        // Initialize scroll position storage (using sessionStorage to persist across reloads)
+        // Key format: 'parallax_scroll_' + pathname
+        
+        // Find the element that is ACTUALLY scrolled
+        function findScrollContainer(startElement) {
+            // First check window scroll
+            if (window.scrollY > 0) {
+                return 'window';
+            }
+
+            // Then check elements starting from the click target
+            let el = startElement;
+            while (el && el !== document.body) {
+                if (el.scrollTop > 0) {
+                    return el;
+                }
+                // Also check if it's potentially scrollable even if at top (for 0 restoration)
+                const style = window.getComputedStyle(el);
+                if ((style.overflowY === 'auto' || style.overflowY === 'scroll') && el.scrollHeight > el.clientHeight) {
+                     // Keep track of this as a candidate but prefer one with >0 scroll
+                }
+                el = el.parentElement;
+            }
+            
+            // Fallback to searching known containers if we didn't start from a click or found nothing
+            const selectors = [
+                '[data-testid="primaryColumn"]',
+                'main[role="main"]',
+                '[role="main"]',
+                'div[style*="overflow"]'
+            ];
+            
+            for (const sel of selectors) {
+                const candidates = document.querySelectorAll(sel);
+                for (const candidate of candidates) {
+                     // Check candidate
+                     if (candidate.scrollTop > 0) return candidate;
+                     // Check parent
+                     if (candidate.parentElement?.scrollTop > 0) return candidate.parentElement;
+                }
+            }
+            
+            return null;
+        }
+
+        // Save scroll position for current page
+        function saveScrollPosition(clickedElement) {
+          const url = window.location.pathname;
+          
+          // Try to find what's scrolled
+          const scroller = findScrollContainer(clickedElement);
+          
+          let value = 0;
+          let type = 'element'; // 'window' or 'element'
+          let selector = ''; // unique selector if possible
+          
+          if (scroller === 'window') {
+              value = window.scrollY;
+              type = 'window';
+              console.log('[SCROLL] Detected WINDOW scroll:', value);
+          } else if (scroller && scroller.tagName) {
+              value = scroller.scrollTop;
+              type = 'element';
+              // Generate a simple unique-ish selector
+              selector = scroller.tagName.toLowerCase();
+              if (scroller.id) selector += '#' + scroller.id;
+              if (scroller.className) selector += '.' + scroller.className.split(' ').join('.');
+              // Fallback for unidentified divs
+              if (selector === 'div' || selector === 'main') {
+                  const testId = scroller.getAttribute('data-testid');
+                  if (testId) selector += \`[data-testid="\${testId}"]\`;
+              }
+              console.log('[SCROLL] Detected ELEMENT scroll:', selector, value);
+          } else {
+              console.log('[SCROLL] No scrollable container found with >0 scroll. Assuming 0.');
+          }
+
+          const data = { value, type, selector };
+          const key = 'parallax_scroll_' + url;
+          sessionStorage.setItem(key, JSON.stringify(data));
+          console.log('[SCROLL] Saved:', url, JSON.stringify(data));
+        }
+
+        // Restore scroll position for current page
+        // For infinite scroll pages, we need to scroll incrementally to trigger content loading
+        function restoreScrollPosition() {
+          const url = window.location.pathname;
+          const key = 'parallax_scroll_' + url;
+          const savedDataStr = sessionStorage.getItem(key);
+
+          if (!savedDataStr) return;
+
+          let savedData;
+          try {
+              savedData = JSON.parse(savedDataStr);
+          } catch {
+              // Handle legacy format (just number)
+              savedData = { value: parseInt(savedDataStr, 10), type: 'element' };
+          }
+
+          const { value, type, selector } = savedData;
+          console.log('[SCROLL] Restoring:', url, JSON.stringify(savedData));
+
+          if (value > 0) {
+            let attempts = 0;
+            let lastScrollPos = -1; // Start at -1 to not count first check as stuck
+            let stuckCount = 0;
+            let contentWaitAttempts = 0;
+            const maxContentWait = 20; // Wait up to 2 seconds for content to appear
+
+            const tryRestore = () => {
+              // First, check if page content has loaded (look for article elements)
+              const hasContent = document.querySelectorAll('article').length > 0;
+              const pageHeight = document.documentElement.scrollHeight;
+
+              if (!hasContent || pageHeight < 1000) {
+                  contentWaitAttempts++;
+                  if (contentWaitAttempts < maxContentWait) {
+                      console.log('[SCROLL] Waiting for content... attempt:', contentWaitAttempts, 'height:', pageHeight, 'articles:', document.querySelectorAll('article').length);
+                      setTimeout(tryRestore, 100);
+                      return;
+                  }
+                  console.log('[SCROLL] Content wait timeout, proceeding anyway');
+              }
+
+              let currentPos = 0;
+              let maxScroll = 0;
+
+              if (type === 'window') {
+                  // For infinite scroll, scroll incrementally to trigger content loading
+                  currentPos = window.scrollY;
+                  maxScroll = document.documentElement.scrollHeight - window.innerHeight;
+
+                  if (currentPos < value) {
+                      // Scroll towards target - use smaller jumps at first to let content load
+                      const jumpSize = Math.min(value - currentPos, attempts < 5 ? 500 : 1500);
+                      window.scrollTo({ top: currentPos + jumpSize, behavior: 'instant' });
+                  } else {
+                      // Fine-tune to exact position
+                      window.scrollTo({ top: value, behavior: 'instant' });
+                  }
+
+                  currentPos = window.scrollY;
+              } else {
+                  // Element-based scrolling
+                  let scroller;
+                  if (selector) {
+                      try { scroller = document.querySelector(selector); } catch {}
+                  }
+                  if (!scroller) {
+                      scroller = findScrollContainer(null);
+                      if (scroller === 'window') scroller = null;
+                  }
+
+                  if (scroller) {
+                      currentPos = scroller.scrollTop;
+                      maxScroll = scroller.scrollHeight - scroller.clientHeight;
+
+                      if (currentPos < value) {
+                          const jumpSize = Math.min(value - currentPos, attempts < 5 ? 500 : 1500);
+                          scroller.scrollTop = currentPos + jumpSize;
+                      } else {
+                          scroller.scrollTop = value;
+                      }
+                      currentPos = scroller.scrollTop;
+                  }
+              }
+
+              // Check if we reached the target (within 100px tolerance for infinite scroll)
+              const reached = Math.abs(currentPos - value) < 100;
+
+              if (reached) {
+                  console.log('[SCROLL] Restore success! At:', currentPos, 'Target:', value);
+                  return;
+              }
+
+              // Check if we're stuck (page hasn't loaded more content)
+              if (currentPos === lastScrollPos) {
+                  stuckCount++;
+              } else {
+                  stuckCount = 0;
+              }
+              lastScrollPos = currentPos;
+
+              attempts++;
+
+              // Be more patient when stuck at position 0 - content may still be loading
+              const stuckThreshold = currentPos === 0 ? 15 : 8;
+
+              if (stuckCount >= stuckThreshold) {
+                  console.log('[SCROLL] Stuck at:', currentPos, '- content may not load further. Target was:', value);
+                  return;
+              }
+
+              // Continue trying for longer on infinite scroll pages (up to 15 seconds)
+              if (attempts < 75) {
+                // Slower interval when waiting for content at position 0
+                const delay = currentPos === 0 ? 250 : 200;
+                setTimeout(tryRestore, delay);
+              } else {
+                  console.log('[SCROLL] Max attempts reached. At:', currentPos, 'Target:', value);
+              }
+            };
+            // Wait a bit longer for initial page render
+            setTimeout(tryRestore, 100);
+          }
+        }
+
+        // Auto-focus the reply composer on post pages
+        function autoFocusComposer() {
+          const isPostPage = /\\/status\\/\\d+/.test(window.location.pathname);
+          console.log('[FOCUS] Checking auto-focus, isPostPage:', isPostPage);
+          if (isPostPage) {
+            let attempts = 0;
+            const tryFocus = async () => {
+              const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
+              console.log('[FOCUS] Attempt', attempts, 'composer:', !!composer);
+              if (composer) {
+                // Scroll into view first to ensure visibility even with large images
+                composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+                await new Promise(r => setTimeout(r, 100));
+                composer.focus();
+                // Also try clicking it as some frameworks require that
+                composer.click();
+                console.log('[FOCUS] Scrolled and Focused/Clicked composer');
+                return;
+              }
+              attempts++;
+              if (attempts < 15) {
+                setTimeout(tryFocus, 300);
+              }
+            };
+            setTimeout(tryFocus, 500);
+          }
+        }
+
+        // Set up click listener for saving scroll position AND split view interception (only once)
+        if (!window.parallaxClickListenerAdded) {
+          window.parallaxClickListenerAdded = true;
+          // Use capture phase to intercept clicks before React/Router handles them
+          document.addEventListener('click', (e) => {
+            // Check if the clicked element or any parent is a tweet link
+            // Expanded selectors to catch more link types
+            const link = e.target.closest('a[href*="/status/"], [data-testid="tweet"]');
+            if (link) {
+              console.log('[SCROLL] Click detected on:', link.tagName);
+              saveScrollPosition(e.target);
+
+              // === SPLIT VIEW INTERCEPTION ===
+              // Check if we should intercept this click for split view
+              const currentPath = window.location.pathname;
+              const shouldIntercept = /^\\/(notifications|home)$/.test(currentPath) || /^\\/i\\/lists\\//.test(currentPath);
+              console.log('[SPLIT] Check intercept: path=' + currentPath + ' shouldIntercept=' + shouldIntercept);
+
+              if (shouldIntercept) {
+                // IMPORTANT: Don't intercept clicks on action buttons (like, retweet, reply, bookmark, share, etc.)
+                const actionButton = e.target.closest('[data-testid="like"], [data-testid="unlike"], [data-testid="retweet"], [data-testid="unretweet"], [data-testid="reply"], [data-testid="bookmark"], [data-testid="removeBookmark"], [data-testid="share"], [data-testid="caret"], [role="button"][aria-label*="Like"], [role="button"][aria-label*="Repost"], [role="button"][aria-label*="Reply"], [role="button"][aria-label*="Bookmark"], [role="button"][aria-label*="Share"]');
+                if (actionButton) {
+                  console.log('[SPLIT] Click on action button, NOT intercepting');
+                  return; // Let the action button work normally
+                }
+
+                // Find the article element
+                const article = e.target.closest('article[data-testid="tweet"]');
+                if (article) {
+                  // Find the post URL from the timestamp link (always present)
+                  // The timestamp link has href like "/username/status/123"
+                  const timeLink = article.querySelector('a[href*="/status/"] time')?.closest('a');
+                  const href = timeLink ? timeLink.getAttribute('href') : null;
+                  console.log('[SPLIT] Article clicked, timeLink href:', href);
+
+                  // Check if it's a post URL (not photo/video modal)
+                  const isPostUrl = href && /^\\/[^/]+\\/status\\/\\d+$/.test(href);
+
+                  if (isPostUrl) {
+                    console.log('[SPLIT] Intercepting post click for split view:', href);
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    // Send message to parent to open in split panel
+                    console.log('[SPLIT_VIEW_REQUEST]' + JSON.stringify({ url: 'https://x.com' + href }));
+                    return false;
+                  }
+                }
+              }
+            }
+          }, true); // Capture phase is CRITICAL here
+
+          // Click-to-focus: when clicking on a post, focus the reply composer
+          document.addEventListener('click', async (e) => {
+            const article = e.target.closest('article[data-testid="tweet"]');
+            if (!article) return;
+
+            // Don't interfere with interactive elements
+            const interactiveEl = e.target.closest('a, button, [role="button"], [data-testid="like"], [data-testid="retweet"], [data-testid="reply"], [role="textbox"], [contenteditable="true"]');
+            if (interactiveEl) return;
+
+            // Only focus if we're on a post page (not home/notifications)
+            const isPostPage = /\\/status\\/\\d+/.test(window.location.pathname);
+            if (!isPostPage) return;
+
+            console.log('[FOCUS] Click on post detected, focusing reply...');
+            await new Promise(r => setTimeout(r, 100));
+
+            const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
+            if (composer) {
+              composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+              await new Promise(r => setTimeout(r, 50));
+              composer.focus();
+              composer.click();
+              console.log('[FOCUS] Click: Scrolled and focused composer');
+            }
+          }, true);
+
+          console.log('[SCROLL] Click listener added (capture phase)');
+        }
+
+        // Check if we just navigated back (URL changed)
+        const currentUrl = window.location.href;
+        
+        // Always try to restore scroll if we have data for this URL
+        // We don't need to be fancy about "back detection" because if the user 
+        // explicitly clicks a link to get here, X/Twitter will usually reset scroll anyway.
+        // But if we have a saved position, it feels better to restore it.
+        // Or we can check if it's NOT a post page.
+        
+        const isPostPage = /\\/status\\/\\d+/.test(window.location.pathname);
+        if (!isPostPage) {
+             console.log('[SCROLL] Not a post page, attempting restore...');
+             restoreScrollPosition();
+        }
+
+        window.parallaxLastUrl = currentUrl;
+
+        // Always try auto-focus on post pages
+        autoFocusComposer();
+
+        // === EVENT LISTENERS (only set up once) ===
+        if (window.parallaxReady) {
+          console.log('[WEBVIEW] Event listeners already set up, skipping');
+          return;
+        }
+        console.log('[WEBVIEW] Setting up event listeners...');
 
         window.isCtrlPressed = false;
         window.hoveredTweetText = null;
@@ -356,7 +1425,9 @@ Write ONLY the reply text, nothing else:`
               }
             }
           } else {
+            // Clear hover text when mouse is NOT over an article
             window.hoveredTweetText = null;
+            window.targetArticle = null;
           }
 
           window.updateHighlight();
@@ -387,29 +1458,31 @@ Write ONLY the reply text, nothing else:`
           }
         }
 
+        // Only track LEFT Ctrl (location === 1) for AI replies
+        // Right Ctrl passes through for standard X/Twitter behavior
         document.addEventListener('keydown', (e) => {
-          if (e.key === 'Control' && !window.isCtrlPressed) {
+          if (e.key === 'Control' && e.location === 1 && !window.isCtrlPressed) {
             window.isCtrlPressed = true;
             window.updateHighlight();
           }
         }, true);
 
         document.addEventListener('keyup', (e) => {
-          if (e.key === 'Control') {
+          if (e.key === 'Control' && e.location === 1) {
             window.isCtrlPressed = false;
             window.updateHighlight();
           }
         }, true);
 
         window.addEventListener('keydown', (e) => {
-          if (e.key === 'Control' && !window.isCtrlPressed) {
+          if (e.key === 'Control' && e.location === 1 && !window.isCtrlPressed) {
             window.isCtrlPressed = true;
             window.updateHighlight();
           }
         }, true);
 
         window.addEventListener('keyup', (e) => {
-          if (e.key === 'Control') {
+          if (e.key === 'Control' && e.location === 1) {
             window.isCtrlPressed = false;
             window.updateHighlight();
           }
@@ -726,13 +1799,12 @@ Write ONLY the reply text, nothing else:`
         console.log('[WEBVIEW] Parallax helper initialized successfully!');
       })();
     `).then(() => {
-            console.log('[INIT] JS injection complete! Setting webviewReady = true')
+            console.log('[INJECT] JS injection complete!')
+            setWebviewReady(true)
+            webviewReadyRef.current = true
         }).catch((err: unknown) => {
-            console.log('[INIT] JS injection failed:', err)
+            console.log('[INJECT] JS injection failed:', err)
         })
-
-        setWebviewReady(true)
-        webviewReadyRef.current = true
     }, [])
 
     const handleRegenerate = () => {
@@ -999,12 +2071,66 @@ Write ONLY the reply text, nothing else:`
         return () => webview.removeEventListener('ipc-message', handleIpcMessage)
     }, [webviewReady])
 
+    // Force dismiss AI replies popup
+    const forceDismissPopup = useCallback(() => {
+        console.log('[POPUP] Force dismissing popup')
+        setHoveredTweet(null)
+        setIsOverPanel(false)
+        setReplies([])
+        generatingForRef.current = null
+        lastTextRef.current = null
+        ctrlPressedRef.current = false
+        setIsCtrlPressed(false)
+        setCustomPrompt('')
+
+        // Also clear Ctrl state in webviews so they don't immediately re-trigger
+        const clearCtrlScript = `
+            window.isCtrlPressed = false;
+            window.hoveredTweetText = null;
+            window.targetArticle = null;
+            if (typeof window.updateHighlight === 'function') window.updateHighlight();
+        `
+        webviewRef.current?.executeJavaScript(clearCtrlScript).catch(() => {})
+        postWebviewRef.current?.executeJavaScript(clearCtrlScript).catch(() => {})
+    }, [])
+
+    // Middle mouse button to force close popup
+    useEffect(() => {
+        const handleMouseDown = (e: MouseEvent) => {
+            // Middle mouse button = button 1
+            if (e.button === 1 && hoveredTweetRef.current) {
+                e.preventDefault()
+                forceDismissPopup()
+            }
+        }
+
+        window.addEventListener('mousedown', handleMouseDown)
+        return () => window.removeEventListener('mousedown', handleMouseDown)
+    }, [forceDismissPopup])
+
     // Parent-level Ctrl tracking (works when parent has focus)
+    // Only LEFT Ctrl triggers AI replies - Right Ctrl passes through for normal X behavior
     useEffect(() => {
         const handleKeyDown = async (e: KeyboardEvent) => {
-            if (e.key === 'Control') {
+            // Only track LEFT Ctrl (location 1) for AI popup
+            // Right Ctrl (location 2) passes through to webview for normal X behavior
+            if (e.key === 'Control' && e.location === 1) {
                 ctrlPressedRef.current = true
                 setIsCtrlPressed(true)
+            }
+
+            // Escape: First close AI popup if open, then close post panel
+            if (e.key === 'Escape') {
+                if (hoveredTweetRef.current) {
+                    e.preventDefault()
+                    forceDismissPopup()
+                    return
+                }
+                if (postPanelUrlRef.current) {
+                    e.preventDefault()
+                    setPostPanelUrl(null)
+                    return
+                }
             }
 
             // Log all Ctrl+Shift combinations for debugging
@@ -1143,7 +2269,8 @@ Write ONLY the reply text, nothing else:`
             }
         }
         const handleKeyUp = (e: KeyboardEvent) => {
-            if (e.key === 'Control') {
+            // Only respond to LEFT Ctrl (location 1) release
+            if (e.key === 'Control' && e.location === 1) {
                 ctrlPressedRef.current = false
                 setIsCtrlPressed(false)
             }
@@ -1164,102 +2291,141 @@ Write ONLY the reply text, nothing else:`
         }
     }, [])
 
-    // Poll webview for state - runs continuously
+    // Poll webview for state - runs continuously (checks both main and post panel webviews)
     useEffect(() => {
         console.log('[POLL] Setting up polling interval...')
         let pollCount = 0
 
+        // Helper to poll a single webview
+        const pollWebview = async (webview: any, isPostPanel: boolean): Promise<{ ctrl: boolean, text: string | null, x: number, y: number, helperReady: boolean } | null> => {
+            try {
+                const readyFlag = isPostPanel ? 'parallaxPostPanelReady' : 'parallaxReady'
+                const result = await webview.executeJavaScript(`
+                    (function() {
+                        return {
+                            ctrl: !!window.isCtrlPressed,
+                            text: window.hoveredTweetText || null,
+                            x: window.lastMouseX || 0,
+                            y: window.lastMouseY || 0,
+                            helperReady: !!window.${readyFlag}
+                        };
+                    })()
+                `)
+                return result
+            } catch {
+                return null
+            }
+        }
+
         const pollInterval = setInterval(async () => {
-            const webview = webviewRef.current
+            const mainWebview = webviewRef.current
+            const postWebview = postWebviewRef.current
             pollCount++
 
             // Log every 100 polls (every 5 seconds)
             if (pollCount % 100 === 0) {
-                console.log(`[POLL ${pollCount}] webview:`, !!webview, 'ready:', webviewReadyRef.current)
+                console.log(`[POLL ${pollCount}] main:`, !!mainWebview, 'mainReady:', webviewReadyRef.current, 'post:', !!postWebview, 'postReady:', postWebviewReadyRef.current)
             }
 
-            if (!webview || !webviewReadyRef.current) {
+            // Poll both webviews in parallel
+            const [mainResult, postResult] = await Promise.all([
+                mainWebview && webviewReadyRef.current ? pollWebview(mainWebview, false) : Promise.resolve(null),
+                postWebview && postWebviewReadyRef.current ? pollWebview(postWebview, true) : Promise.resolve(null)
+            ])
+
+            // Determine which webview has focus/hover (prefer post panel if it has hover text)
+            let activeResult: { ctrl: boolean, text: string | null, x: number, y: number, helperReady: boolean } | null = null
+            let activeSource: 'main' | 'post' = 'main'
+
+            // Post panel takes priority if it has hovered text
+            if (postResult && postResult.text) {
+                activeResult = postResult
+                activeSource = 'post'
+            } else if (mainResult) {
+                activeResult = mainResult
+                activeSource = 'main'
+            }
+
+            if (!activeResult) {
                 if (pollCount % 100 === 0) {
-                    console.log('[POLL] Skipping - not ready. webview:', !!webview, 'readyRef:', webviewReadyRef.current)
+                    console.log('[POLL] No webview ready')
                 }
                 return
             }
 
-            try {
-                const result = await webview.executeJavaScript(`
-          (function() {
-            return {
-              ctrl: !!window.isCtrlPressed,
-              text: window.hoveredTweetText || null,
-              x: window.lastMouseX || 0,
-              y: window.lastMouseY || 0,
-              helperReady: !!window.parallaxReady
-            };
-          })()
-        `)
+            // Combine webview Ctrl with parent Ctrl (OR them)
+            const webviewCtrl = activeResult.ctrl || (mainResult?.ctrl) || (postResult?.ctrl)
+            const parentCtrl = ctrlPressedRef.current
+            const newCtrlState = webviewCtrl || parentCtrl
 
-                // Log if helper isn't ready
-                if (!result.helperReady && pollCount % 100 === 0) {
-                    console.log('[POLL] Helper not ready in webview!')
+            // Log Ctrl state changes
+            if (newCtrlState && pollCount % 20 === 0) {
+                console.log('[POLL] Ctrl pressed! source:', activeSource, 'text:', activeResult.text?.slice(0, 30))
+            }
+
+            // Push parent Ctrl state to both webviews if different
+            if (parentCtrl) {
+                if (mainWebview && mainResult && !mainResult.ctrl) {
+                    mainWebview.executeJavaScript(`
+                        window.isCtrlPressed = true;
+                        if (typeof window.updateHighlight === 'function') window.updateHighlight();
+                    `).catch(() => { })
                 }
-
-                // Combine webview Ctrl with parent Ctrl (OR them)
-                const webviewCtrl = result.ctrl
-                const parentCtrl = ctrlPressedRef.current
-                const newCtrlState = webviewCtrl || parentCtrl
-
-                // Log Ctrl state changes
-                if (newCtrlState && pollCount % 20 === 0) {
-                    console.log('[POLL] Ctrl pressed! webviewCtrl:', webviewCtrl, 'parentCtrl:', parentCtrl, 'text:', result.text?.slice(0, 30))
+                if (postWebview && postResult && !postResult.ctrl) {
+                    postWebview.executeJavaScript(`
+                        window.isCtrlPressed = true;
+                        if (typeof window.updateHighlight === 'function') window.updateHighlight();
+                    `).catch(() => { })
                 }
+            }
 
-                // Push parent Ctrl state to webview if different
-                if (parentCtrl && !webviewCtrl) {
-                    webview.executeJavaScript(`
-            window.isCtrlPressed = true;
-            if (typeof window.updateHighlight === 'function') window.updateHighlight();
-          `).catch(() => { })
+            setIsCtrlPressed(newCtrlState)
+
+            // Handle Ctrl release
+            if (!newCtrlState && !isOverPanelRef.current) {
+                if (hoveredTweetRef.current) {
+                    setHoveredTweet(null)
+                    setReplies([])
+                    generatingForRef.current = null
+                    lastTextRef.current = null
+                    setCustomPrompt('')
                 }
+                return
+            }
 
-                setIsCtrlPressed(newCtrlState)
+            // Clear popup if Ctrl pressed but no tweet is hovered
+            if (newCtrlState && !activeResult.text && !isOverPanelRef.current) {
+                if (hoveredTweetRef.current) {
+                    console.log('[POLL] Ctrl pressed but no tweet hovered - clearing popup')
+                    setHoveredTweet(null)
+                    setReplies([])
+                    generatingForRef.current = null
+                    lastTextRef.current = null
+                    setCustomPrompt('')
+                }
+                return
+            }
 
-                // Handle Ctrl release
-                if (!newCtrlState && !isOverPanelRef.current) {
-                    if (hoveredTweetRef.current) {
-                        setHoveredTweet(null)
-                        setReplies([])
-                        generatingForRef.current = null
-                        lastTextRef.current = null
-                        setCustomPrompt('')
+            // Update hovered tweet if Ctrl is pressed
+            if (newCtrlState && activeResult.text) {
+                if (activeResult.text !== lastTextRef.current) {
+                    // NEW tweet - set position once and track source
+                    console.log('[POLL] NEW TWEET DETECTED from', activeSource + ':', activeResult.text.slice(0, 50), '...')
+                    lastTextRef.current = activeResult.text
+                    activeHoverWebviewRef.current = activeSource
+                    setHoveredTweet({
+                        id: Date.now().toString(),
+                        text: activeResult.text,
+                        x: activeResult.x,
+                        y: activeResult.y
+                    })
+                    setCustomPrompt('')
+                    if (generateRepliesRef.current) {
+                        console.log('[POLL] Calling generateReplies...')
+                        generateRepliesRef.current(activeResult.text)
+                    } else {
+                        console.log('[POLL] ERROR: generateRepliesRef.current is null!')
                     }
-                    return
-                }
-
-                // Update hovered tweet if Ctrl is pressed
-                if (newCtrlState && result.text) {
-                    if (result.text !== lastTextRef.current) {
-                        // NEW tweet - set position once
-                        console.log('[POLL] NEW TWEET DETECTED:', result.text.slice(0, 50), '...')
-                        lastTextRef.current = result.text
-                        setHoveredTweet({
-                            id: Date.now().toString(),
-                            text: result.text,
-                            x: result.x,
-                            y: result.y
-                        })
-                        setCustomPrompt('')
-                        if (generateRepliesRef.current) {
-                            console.log('[POLL] Calling generateReplies...')
-                            generateRepliesRef.current(result.text)
-                        } else {
-                            console.log('[POLL] ERROR: generateRepliesRef.current is null!')
-                        }
-                    }
-                }
-            } catch (err) {
-                // Webview not ready or error - could reinitialize here if needed
-                if (pollCount % 100 === 0) {
-                    console.log('[POLL] executeJavaScript error:', err)
                 }
             }
         }, 50)
@@ -1271,223 +2437,8 @@ Write ONLY the reply text, nothing else:`
             try {
                 const ready = await webview.executeJavaScript(`!!window.parallaxReady`)
                 if (!ready) {
-                    console.log('[HEALTH] Parallax helper not ready, reinitializing...')
-                    // Reinject the helper JS with same logic as main init
-                    await webview.executeJavaScript(`
-            (function() {
-              if (window.parallaxReady) return;
-              console.log('[WEBVIEW] Reinitializing Parallax helper...');
-
-              window.isCtrlPressed = false;
-              window.hoveredTweetText = null;
-              window.currentHoveredArticle = null;
-              window.lastMouseX = 0;
-              window.lastMouseY = 0;
-              window.lastArticleUnderMouse = null;
-              window.targetArticle = null;
-
-              // ALWAYS capture tweet text on mousemove
-              document.addEventListener('mousemove', (e) => {
-                window.lastMouseX = e.clientX;
-                window.lastMouseY = e.clientY;
-                const article = e.target.closest('article[data-testid="tweet"]');
-                window.lastArticleUnderMouse = article;
-
-                if (article) {
-                  const textEl = article.querySelector('[data-testid="tweetText"]');
-                  if (textEl) {
-                    const text = textEl.innerText.trim();
-                    if (text && text.length >= 5) {
-                      window.hoveredTweetText = text;
-                      window.targetArticle = article;
-                    }
-                  }
-                } else {
-                  window.hoveredTweetText = null;
-                }
-
-                if (window.updateHighlight) window.updateHighlight();
-              }, true);
-
-              window.updateHighlight = function() {
-                const article = window.lastArticleUnderMouse;
-                if (!window.isCtrlPressed) {
-                  if (window.currentHoveredArticle) {
-                    window.currentHoveredArticle.classList.remove('parallax-hover');
-                    window.currentHoveredArticle = null;
-                  }
-                  return;
-                }
-                if (!article) {
-                  if (window.currentHoveredArticle) {
-                    window.currentHoveredArticle.classList.remove('parallax-hover');
-                    window.currentHoveredArticle = null;
-                  }
-                  return;
-                }
-                if (article !== window.currentHoveredArticle) {
-                  if (window.currentHoveredArticle) {
-                    window.currentHoveredArticle.classList.remove('parallax-hover');
-                  }
-                  window.currentHoveredArticle = article;
-                  article.classList.add('parallax-hover');
-                }
-              };
-
-              document.addEventListener('keydown', (e) => {
-                if (e.key === 'Control' && !window.isCtrlPressed) {
-                  window.isCtrlPressed = true;
-                  window.updateHighlight();
-                }
-              }, true);
-              document.addEventListener('keyup', (e) => {
-                if (e.key === 'Control') {
-                  window.isCtrlPressed = false;
-                  window.updateHighlight();
-                }
-              }, true);
-              window.addEventListener('blur', () => {
-                window.isCtrlPressed = false;
-                window.updateHighlight();
-              });
-
-              window.insertReply = async (replyText) => {
-                const article = window.targetArticle || window.currentHoveredArticle || window.lastArticleUnderMouse;
-                if (!article) return false;
-                const replyBtn = article.querySelector('[data-testid="reply"]');
-                if (!replyBtn) return false;
-                replyBtn.click();
-                await new Promise(r => setTimeout(r, 800));
-                const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
-                if (!composer) return false;
-                composer.focus();
-                await new Promise(r => setTimeout(r, 150));
-                document.execCommand('selectAll', false, null);
-                document.execCommand('insertText', false, replyText);
-                await new Promise(r => setTimeout(r, 300));
-                const submitBtn = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
-                if (submitBtn && !submitBtn.disabled) submitBtn.click();
-                await new Promise(r => setTimeout(r, 500));
-                window.targetArticle = null;
-                window.currentHoveredArticle = null;
-                window.hoveredTweetText = null;
-                window.isCtrlPressed = false;
-                document.querySelectorAll('.parallax-hover').forEach(el => el.classList.remove('parallax-hover'));
-                return true;
-              };
-
-              document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') {
-                  const backBtn = document.querySelector('[data-testid="app-bar-back"]') ||
-                                  document.querySelector('[aria-label="Back"]');
-                  if (backBtn) { backBtn.click(); e.preventDefault(); }
-                }
-              }, true);
-
-              // Clipboard paste interception for image support
-              if (!window.pendingPasteRequests) {
-                window.pendingPasteRequests = {};
-                window.pasteInProgress = false;
-
-                window.addEventListener('message', (event) => {
-                  if (event.data && event.data.type === 'clipboard-paste-response') {
-                    const { requestId, dataType, data } = event.data;
-                    const resolver = window.pendingPasteRequests[requestId];
-                    if (resolver) {
-                      resolver({ dataType, data });
-                      delete window.pendingPasteRequests[requestId];
-                    }
-                  }
-                });
-
-                // Handle Ctrl+V directly via keydown
-                document.addEventListener('keydown', async (e) => {
-                  if ((e.ctrlKey || e.metaKey) && e.key === 'v' && !window.pasteInProgress) {
-                    const activeEl = document.activeElement;
-                    const isInComposer = activeEl && (
-                      activeEl.matches('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"], [role="textbox"], [contenteditable="true"]') ||
-                      activeEl.closest('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"], [role="textbox"], [contenteditable="true"]')
-                    );
-                    if (!isInComposer) return;
-
-                    console.log('[CLIPBOARD] Ctrl+V detected in composer');
-                    window.pasteInProgress = true;
-
-                    const requestId = Date.now() + '_' + Math.random().toString(36).slice(2);
-                    const clipboardPromise = new Promise((resolve) => {
-                      window.pendingPasteRequests[requestId] = resolve;
-                      setTimeout(() => {
-                        if (window.pendingPasteRequests[requestId]) {
-                          delete window.pendingPasteRequests[requestId];
-                          resolve(null);
-                        }
-                      }, 2000);
-                    });
-
-                    console.log('[CLIPBOARD_REQUEST]', JSON.stringify({ type: 'clipboard-paste-request', requestId }));
-
-                    const result = await clipboardPromise;
-                    window.pasteInProgress = false;
-
-                    if (result && result.dataType === 'image' && result.data) {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      try {
-                        // Convert data URL to blob without using fetch (may be blocked by CSP)
-                        const dataUrl = result.data;
-                        const parts = dataUrl.split(',');
-                        const mimeMatch = parts[0].match(/:(.*?);/);
-                        const mime = mimeMatch ? mimeMatch[1] : 'image/png';
-                        const bstr = atob(parts[1]);
-                        let n = bstr.length;
-                        const u8arr = new Uint8Array(n);
-                        while (n--) {
-                          u8arr[n] = bstr.charCodeAt(n);
-                        }
-                        const blob = new Blob([u8arr], { type: mime });
-                        const file = new File([blob], 'pasted-image.png', { type: 'image/png' });
-                        const dt = new DataTransfer();
-                        dt.items.add(file);
-
-                        // Find ALL file inputs
-                        const fileInputs = document.querySelectorAll('input[type="file"][accept*="image"]');
-                        fileInputs.forEach((fileInput) => {
-                          try {
-                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'files').set;
-                            nativeInputValueSetter.call(fileInput, dt.files);
-                            fileInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-                            fileInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                          } catch (err) {}
-                        });
-
-                        // Try drop on all composers
-                        const composers = document.querySelectorAll('[data-testid="tweetTextarea_0"], [data-testid="tweetTextarea_1"]');
-                        composers.forEach((composer) => {
-                          const dropTarget = composer.closest('[data-testid="toolBar"]')?.parentElement ||
-                                             composer.closest('[role="dialog"]') ||
-                                             composer.closest('[data-testid="primaryColumn"]') ||
-                                             composer.parentElement;
-                          if (dropTarget) {
-                            dropTarget.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt }));
-                            dropTarget.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt }));
-                            dropTarget.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-                          }
-                        });
-                      } catch (err) {
-                        console.error('[CLIPBOARD] Error processing image:', err);
-                      }
-                    } else if (result && result.dataType === 'text' && result.data) {
-                      document.execCommand('insertText', false, result.data);
-                      e.preventDefault();
-                    }
-                  }
-                }, true);
-              }
-
-              window.parallaxReady = true;
-              console.log('[WEBVIEW] Parallax helper reinitialized!');
-            })();
-          `)
+                    console.log('[HEALTH] Parallax helper not ready, reinjecting...')
+                    injectHelpers(webview)
                 }
             } catch {
                 // Ignore
@@ -1504,6 +2455,14 @@ Write ONLY the reply text, nothing else:`
     const handleReplyClick = async (reply: string, style: string) => {
         setCopiedStyle(style)
 
+        // Determine which webview to insert reply into
+        const targetWebview = activeHoverWebviewRef.current === 'post'
+            ? postWebviewRef.current
+            : webviewRef.current
+        const targetName = activeHoverWebviewRef.current
+
+        console.log('[REPLY] Inserting reply into', targetName, 'webview')
+
         // Dismiss the panel immediately
         setHoveredTweet(null)
         setIsOverPanel(false)
@@ -1513,13 +2472,15 @@ Write ONLY the reply text, nothing else:`
         ctrlPressedRef.current = false
         setIsCtrlPressed(false)
 
-        const webview = webviewRef.current
-        if (webview) {
+        if (targetWebview) {
             try {
-                await webview.executeJavaScript(`window.insertReply(${JSON.stringify(reply)})`)
+                await targetWebview.executeJavaScript(`window.insertReply(${JSON.stringify(reply)})`)
+                console.log('[REPLY] Reply inserted successfully into', targetName)
             } catch (err) {
-                console.error('Failed to insert reply:', err)
+                console.error('[REPLY] Failed to insert reply into', targetName + ':', err)
             }
+        } else {
+            console.error('[REPLY] No target webview available')
         }
 
         setTimeout(() => setCopiedStyle(null), 1500)
@@ -1549,18 +2510,99 @@ Write ONLY the reply text, nothing else:`
 
     const showPanel = (hoveredTweet && isCtrlPressed) || (hoveredTweet && isOverPanel)
 
+    const handleNavigate = () => {
+        const webview = webviewRef.current
+        if (webview && urlInput) {
+            let url = urlInput
+            if (!url.startsWith('http://') && !url.startsWith('https://')) {
+                url = 'https://' + url
+            }
+            webview.loadURL(url)
+            setCurrentUrl(url)
+        }
+    }
+
     return (
-        <div className="h-screen bg-black text-white overflow-hidden relative">
-            <webview
-                ref={webviewCallbackRef}
-                src="https://x.com/home"
-                className="w-full h-full"
-                {...{
-                    allowpopups: 'true',
-                    partition: 'persist:x',
-                    webpreferences: 'contextIsolation=no, javascript=yes, images=yes, webSecurity=yes'
-                } as any}
-            />
+        <div className="h-screen bg-black text-white overflow-hidden relative flex flex-col">
+            {/* URL Bar */}
+            <div className="flex items-center gap-2 px-3 py-2 bg-gray-900 border-b border-gray-700">
+                <button
+                    onClick={() => webviewRef.current?.goBack()}
+                    className="px-2 py-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+                >
+                    ←
+                </button>
+                <button
+                    onClick={() => webviewRef.current?.goForward()}
+                    className="px-2 py-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+                >
+                    →
+                </button>
+                <button
+                    onClick={() => webviewRef.current?.reload()}
+                    className="px-2 py-1 text-gray-400 hover:text-white hover:bg-gray-700 rounded"
+                >
+                    ↻
+                </button>
+                <input
+                    type="text"
+                    value={urlInput}
+                    onChange={(e) => setUrlInput(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && handleNavigate()}
+                    className="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-1 text-sm text-white focus:outline-none focus:border-blue-500"
+                    placeholder="Enter URL..."
+                />
+                <button
+                    onClick={handleNavigate}
+                    className="px-3 py-1 bg-blue-600 hover:bg-blue-500 rounded text-sm"
+                >
+                    Go
+                </button>
+            </div>
+
+            {/* Main content area - split when post panel is open */}
+            <div className="flex-1 flex">
+                {/* Main webview (notifications/feed) */}
+                <webview
+                    ref={webviewCallbackRef}
+                    src={currentUrl}
+                    className={`flex-1 h-full ${postPanelUrl ? 'w-1/2' : 'w-full'}`}
+                    style={{ transition: 'width 0.2s ease-out' }}
+                    {...{
+                        allowpopups: 'true',
+                        partition: 'persist:x',
+                        plugins: 'true',
+                        webpreferences: 'contextIsolation=no, javascript=yes, images=yes, plugins=yes, webSecurity=yes'
+                    } as any}
+                />
+
+                {/* Post panel webview - shows when a post is opened */}
+                {postPanelUrl && (
+                    <div className="w-1/2 h-full flex flex-col border-l border-gray-700 relative">
+                        {/* Close button */}
+                        <button
+                            onClick={() => setPostPanelUrl(null)}
+                            className="absolute top-2 right-2 z-10 p-1.5 bg-gray-800/90 hover:bg-gray-700 rounded-full text-gray-400 hover:text-white transition-colors"
+                            title="Close panel (Esc)"
+                        >
+                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                            </svg>
+                        </button>
+                        <webview
+                            ref={postWebviewCallbackRef}
+                            src={postPanelUrl}
+                            className="flex-1 w-full h-full"
+                            {...{
+                                allowpopups: 'true',
+                                partition: 'persist:x',
+                                plugins: 'true',
+                                webpreferences: 'contextIsolation=no, javascript=yes, images=yes, plugins=yes, webSecurity=yes'
+                            } as any}
+                        />
+                    </div>
+                )}
+            </div>
 
             {/* Ctrl indicator */}
             <AnimatePresence>
@@ -1601,6 +2643,13 @@ Write ONLY the reply text, nothing else:`
                         style={getPanelStyle()}
                         onMouseEnter={() => setIsOverPanel(true)}
                         onMouseLeave={() => setIsOverPanel(false)}
+                        onMouseDown={(e) => {
+                            // Middle mouse button (button 1) closes popup
+                            if (e.button === 1) {
+                                e.preventDefault()
+                                forceDismissPopup()
+                            }
+                        }}
                     >
                         <div className="bg-black/95 backdrop-blur-xl border border-blue-500/40 rounded-2xl overflow-hidden shadow-2xl">
                             {/* Header */}
@@ -1614,14 +2663,25 @@ Write ONLY the reply text, nothing else:`
                                         />
                                         <span className="text-sm font-semibold text-blue-400">Replies</span>
                                     </div>
-                                    <button
-                                        onClick={handleRegenerate}
-                                        disabled={isRegenerating}
-                                        className="p-1.5 hover:bg-white/10 rounded-lg transition-colors disabled:opacity-50"
-                                        title="Regenerate"
-                                    >
-                                        <RefreshCw className={`w-4 h-4 text-blue-400 ${isRegenerating ? 'animate-spin' : ''}`} />
-                                    </button>
+                                    <div className="flex items-center gap-1">
+                                        <button
+                                            onClick={handleRegenerate}
+                                            disabled={isRegenerating}
+                                            className="p-1.5 hover:bg-white/10 rounded-lg transition-colors disabled:opacity-50"
+                                            title="Regenerate"
+                                        >
+                                            <RefreshCw className={`w-4 h-4 text-blue-400 ${isRegenerating ? 'animate-spin' : ''}`} />
+                                        </button>
+                                        <button
+                                            onClick={forceDismissPopup}
+                                            className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
+                                            title="Close (Esc or Middle-click)"
+                                        >
+                                            <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                                            </svg>
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
 
