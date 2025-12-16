@@ -23,6 +23,12 @@ const GROQ_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
 const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || ''
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 const PARALLAX_MODEL = import.meta.env.VITE_PARALLAX_MODEL || 'default'
+const PARALLAX_TIMEOUT = 5000 // 5 seconds - fail fast for local server
+const GROQ_TIMEOUT = 30000 // 30 seconds for cloud
+
+// Track Parallax availability - skip it if recently failed
+let parallaxUnavailableUntil = 0
+const PARALLAX_COOLDOWN = 60000 // Wait 60 seconds before retrying Parallax after failure
 
 // Helper to make request with timeout
 async function fetchWithTimeout(url: string, options: RequestInit, timeout: number): Promise<Response> {
@@ -132,75 +138,99 @@ Tweet to reply to: "${tweetText.slice(0, 500)}"
 
 Write ONLY the reply text, nothing else:`
 
-            // Use configured API backend with retry logic
-            const maxRetries = 3
+            // Determine which backends to try
+            const wantsParallax = API_BACKEND === 'parallax'
+            const parallaxAvailable = wantsParallax && Date.now() > parallaxUnavailableUntil
+
+            // Build list of backends to try: Parallax first (if configured & available), then Groq as fallback
+            const backends = []
+            if (parallaxAvailable) {
+                backends.push({ name: 'Parallax', endpoint: PARALLAX_ENDPOINT, model: PARALLAX_MODEL, timeout: PARALLAX_TIMEOUT, useAuth: false })
+            }
+            if (GROQ_API_KEY) {
+                backends.push({ name: 'Groq', endpoint: GROQ_ENDPOINT, model: GROQ_MODEL, timeout: GROQ_TIMEOUT, useAuth: true })
+            }
+
+            if (backends.length === 0) {
+                console.error('[API] No backends available (no Parallax or Groq API key)')
+                setReplies(prev => prev.map(r =>
+                    r.style === styleInfo.style ? { ...r, reply: 'no api configured', loading: false } : r
+                ))
+                return
+            }
+
             let lastError: Error | null = null
-            const useParallax = API_BACKEND === 'parallax'
-            const endpoint = useParallax ? PARALLAX_ENDPOINT : GROQ_ENDPOINT
-            const model = useParallax ? PARALLAX_MODEL : GROQ_MODEL
 
-            for (let attempt = 0; attempt < maxRetries; attempt++) {
-                try {
-                    console.log(`[API] Attempt ${attempt + 1} using ${useParallax ? 'Parallax' : 'Groq'}`)
+            for (const backend of backends) {
+                const maxRetries = backend.name === 'Parallax' ? 1 : 3 // Only 1 try for Parallax, 3 for Groq
 
-                    const headers: Record<string, string> = {
-                        'Content-Type': 'application/json',
+                for (let attempt = 0; attempt < maxRetries; attempt++) {
+                    try {
+                        console.log(`[API] ${backend.name} attempt ${attempt + 1}/${maxRetries}`)
+
+                        const headers: Record<string, string> = {
+                            'Content-Type': 'application/json',
+                        }
+                        if (backend.useAuth && GROQ_API_KEY) {
+                            headers['Authorization'] = `Bearer ${GROQ_API_KEY}`
+                        }
+
+                        const response = await fetchWithTimeout(backend.endpoint, {
+                            method: 'POST',
+                            headers,
+                            body: JSON.stringify({
+                                model: backend.model,
+                                messages: [{ role: 'user', content: prompt }],
+                                max_tokens: 80,
+                                temperature: 1.0,
+                            })
+                        }, backend.timeout)
+
+                        if (response.status === 429) {
+                            const waitTime = Math.pow(2, attempt) * 1000
+                            console.log(`[API] ${backend.name} rate limited, waiting ${waitTime}ms`)
+                            await new Promise(r => setTimeout(r, waitTime))
+                            continue
+                        }
+
+                        if (!response.ok) {
+                            const errorBody = await response.text()
+                            console.error(`[API] ${backend.name} error ${response.status}:`, errorBody)
+                            throw new Error(`${backend.name} error ${response.status}`)
+                        }
+
+                        const data = await response.json()
+                        let reply = data.choices?.[0]?.message?.content?.trim() || ''
+                        reply = reply.replace(/^["']|["']$/g, '')
+                        reply = reply.replace(/—/g, '-')
+                        reply = reply.toLowerCase()
+
+                        console.log(`[API] ${backend.name} success for ${styleInfo.style}`)
+                        setReplies(prev => prev.map(r =>
+                            r.style === styleInfo.style ? { ...r, reply, loading: false } : r
+                        ))
+                        return // Success!
+                    } catch (error) {
+                        lastError = error instanceof Error ? error : new Error('unknown error')
+                        const isTimeout = error instanceof Error && error.name === 'AbortError'
+                        console.error(`[API] ${backend.name} attempt ${attempt + 1} failed:`, isTimeout ? 'timeout' : error)
+
+                        // If Parallax failed, mark it unavailable and move to next backend
+                        if (backend.name === 'Parallax') {
+                            console.log(`[API] Parallax unavailable, cooling down for ${PARALLAX_COOLDOWN/1000}s, falling back to Groq`)
+                            parallaxUnavailableUntil = Date.now() + PARALLAX_COOLDOWN
+                            break // Exit retry loop, try next backend
+                        }
                     }
-                    // Only add Authorization header for Groq
-                    if (!useParallax && GROQ_API_KEY) {
-                        headers['Authorization'] = `Bearer ${GROQ_API_KEY}`
-                    }
-
-                    const response = await fetchWithTimeout(endpoint, {
-                        method: 'POST',
-                        headers,
-                        body: JSON.stringify({
-                            model,
-                            messages: [{ role: 'user', content: prompt }],
-                            max_tokens: 80,
-                            temperature: 1.0,
-                        })
-                    }, 30000)
-
-                    if (response.status === 429) {
-                        // Rate limited - wait and retry
-                        const waitTime = Math.pow(2, attempt) * 1000 // 1s, 2s, 4s
-                        console.log(`[API] Rate limited, waiting ${waitTime}ms before retry ${attempt + 1}/${maxRetries}`)
-                        await new Promise(r => setTimeout(r, waitTime))
-                        continue
-                    }
-
-                    if (!response.ok) {
-                        const errorBody = await response.text()
-                        const message = `api error ${response.status}`
-                        console.error('[API]', message, errorBody)
-                        throw new Error(message)
-                    }
-
-                    const data = await response.json()
-                    let reply = data.choices?.[0]?.message?.content?.trim() || ''
-                    // Clean up the reply
-                    reply = reply.replace(/^["']|["']$/g, '') // Remove quotes
-                    reply = reply.replace(/—/g, '-') // Replace em dashes
-                    reply = reply.toLowerCase()
-
-                    setReplies(prev => prev.map(r =>
-                        r.style === styleInfo.style ? { ...r, reply, loading: false } : r
-                    ))
-                    return // Success - exit retry loop
-                } catch (error) {
-                    lastError = error instanceof Error ? error : new Error('unknown error')
-                    const isAbort = error instanceof Error && error.name === 'AbortError'
-                    console.error(`[API] Attempt ${attempt + 1} failed (${isAbort ? 'timeout' : 'error'}):`, error)
                 }
             }
 
-            // All retries exhausted
-            console.error('[API] All retries failed for', styleInfo.style)
+            // All backends exhausted
+            console.error('[API] All backends failed for', styleInfo.style)
             setReplies(prev => prev.map(r =>
                 r.style === styleInfo.style ? {
                     ...r,
-                    reply: lastError?.message || 'rate limited',
+                    reply: lastError?.message || 'failed',
                     loading: false
                 } : r
             ))
@@ -273,6 +303,12 @@ Write ONLY the reply text, nothing else:`
                             `).catch(() => {})
                         }
                     }, 300)
+
+                    // Store pending reply text if provided
+                    const pendingReplyText = request.replyText || null
+                    if (pendingReplyText) {
+                        console.log('[RENDERER] Will insert reply after focus:', pendingReplyText.slice(0, 30))
+                    }
 
                     // Aggressive focus sequence for post panel composer
                     const focusComposer = (attempt: number) => {
@@ -382,6 +418,19 @@ Write ONLY the reply text, nothing else:`
                                 }
                                 // Also focus the webview element
                                 postWv.focus()
+
+                                // If we have reply text to insert, do it now
+                                if (pendingReplyText) {
+                                    debugLog('[SPLIT] Inserting pending reply text...')
+                                    setTimeout(async () => {
+                                        try {
+                                            await postWv.executeJavaScript(`window.insertReply(${JSON.stringify(pendingReplyText)})`)
+                                            debugLog('[SPLIT] Reply inserted successfully')
+                                        } catch (e) {
+                                            debugLog('[SPLIT] Reply insert error: ' + e)
+                                        }
+                                    }, 500)
+                                }
                             }
                         }).catch((err: unknown) => {
                             debugLog('[SPLIT] Focus error: ' + err)
@@ -638,12 +687,20 @@ Write ONLY the reply text, nothing else:`
                         will-change: transform !important;
                         transform: translateZ(0) !important;
                     }
-                    /* Hover highlight */
+                    /* Hover highlight - red glow */
                     .parallax-hover {
-                        background: rgba(29, 155, 240, 0.15) !important;
-                        outline: 2px solid rgba(29, 155, 240, 0.6) !important;
+                        background: rgba(239, 68, 68, 0.15) !important;
+                        outline: 2px solid rgba(239, 68, 68, 0.6) !important;
                         outline-offset: -2px;
                         border-radius: 12px;
+                        box-shadow: 0 0 15px rgba(239, 68, 68, 0.4) !important;
+                    }
+                    .parallax-replying {
+                        background: rgba(239, 68, 68, 0.15) !important;
+                        outline: 3px solid rgba(239, 68, 68, 0.8) !important;
+                        outline-offset: -2px;
+                        border-radius: 12px;
+                        box-shadow: 0 0 20px rgba(239, 68, 68, 0.5) !important;
                     }
                 `).catch((err: unknown) => console.log('[POST-PANEL] CSS error:', err))
 
@@ -671,7 +728,7 @@ Write ONLY the reply text, nothing else:`
                             }
                         };
 
-                        // Mouse move tracking - CLEAR text when not over an article
+                        // Mouse move tracking
                         document.addEventListener('mousemove', (e) => {
                             window.lastMouseX = e.clientX;
                             window.lastMouseY = e.clientY;
@@ -684,10 +741,18 @@ Write ONLY the reply text, nothing else:`
                                     if (text && text.length >= 5) {
                                         window.hoveredTweetText = text;
                                         window.targetArticle = article;
+                                    } else {
+                                        // Post has no meaningful text (image/video only) - clear
+                                        window.hoveredTweetText = null;
+                                        window.targetArticle = article;
                                     }
+                                } else {
+                                    // No text element at all - clear
+                                    window.hoveredTweetText = null;
+                                    window.targetArticle = article;
                                 }
                             } else {
-                                // IMPORTANT: Clear hover text when mouse is NOT over an article
+                                // Not over an article - clear hover state
                                 window.hoveredTweetText = null;
                                 window.targetArticle = null;
                             }
@@ -713,45 +778,43 @@ Write ONLY the reply text, nothing else:`
                         });
 
                         // Reply insertion function with clear and auto-submit
-                        window.insertReply = function(text) {
+                        window.insertReply = async function(text) {
                             console.log('[POST-PANEL] insertReply called with:', text?.slice(0, 50));
+
+                            // Find the composer
                             const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
-                            if (composer) {
-                                composer.focus();
-
-                                // Clear existing content first by selecting all and deleting
-                                document.execCommand('selectAll', false, null);
-                                document.execCommand('delete', false, null);
-
-                                // Insert new text via paste
-                                const dataTransfer = new DataTransfer();
-                                dataTransfer.setData('text/plain', text);
-                                const pasteEvent = new ClipboardEvent('paste', {
-                                    bubbles: true,
-                                    cancelable: true,
-                                    clipboardData: dataTransfer
-                                });
-                                composer.dispatchEvent(pasteEvent);
-                                console.log('[POST-PANEL] Reply inserted via paste event');
-
-                                // Auto-submit after a short delay (wait for button to become enabled)
-                                const trySubmit = (attempts) => {
-                                    const replyButton = document.querySelector('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]');
-                                    console.log('[POST-PANEL] Submit attempt', attempts, 'button:', !!replyButton, 'disabled:', replyButton?.disabled);
-                                    if (replyButton && !replyButton.disabled) {
-                                        console.log('[POST-PANEL] Clicking reply button...');
-                                        replyButton.click();
-                                    } else if (attempts < 10) {
-                                        // Button might not be enabled yet, retry
-                                        setTimeout(() => trySubmit(attempts + 1), 200);
-                                    } else {
-                                        console.log('[POST-PANEL] Reply button not found or stayed disabled after retries');
-                                    }
-                                };
-                                setTimeout(() => trySubmit(0), 300);
-                            } else {
+                            if (!composer) {
                                 console.log('[POST-PANEL] No composer found for reply insertion');
+                                return false;
                             }
+
+                            // Scroll into view and focus
+                            composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+                            await new Promise(r => setTimeout(r, 100));
+                            composer.focus();
+                            await new Promise(r => setTimeout(r, 100));
+
+                            // Clear and insert using execCommand (works better with DraftJS)
+                            document.execCommand('selectAll', false, null);
+                            document.execCommand('insertText', false, text);
+                            console.log('[POST-PANEL] Reply inserted via insertText');
+
+                            // Auto-submit after a short delay (wait for button to become enabled)
+                            const trySubmit = (attempts) => {
+                                const replyButton = document.querySelector('[data-testid="tweetButtonInline"], [data-testid="tweetButton"]');
+                                console.log('[POST-PANEL] Submit attempt', attempts, 'button:', !!replyButton, 'disabled:', replyButton?.disabled);
+                                if (replyButton && !replyButton.disabled) {
+                                    console.log('[POST-PANEL] Clicking reply button...');
+                                    replyButton.click();
+                                } else if (attempts < 10) {
+                                    // Button might not be enabled yet, retry
+                                    setTimeout(() => trySubmit(attempts + 1), 200);
+                                } else {
+                                    console.log('[POST-PANEL] Reply button not found or stayed disabled after retries');
+                                }
+                            };
+                            setTimeout(() => trySubmit(0), 300);
+                            return true;
                         };
 
                         window.parallaxPostPanelReady = true;
@@ -1023,10 +1086,18 @@ Write ONLY the reply text, nothing else:`
       }
       [data-testid="placementTracking"] { display: none !important; }
       .parallax-hover {
-        background: rgba(29, 155, 240, 0.15) !important;
-        outline: 2px solid rgba(29, 155, 240, 0.6) !important;
+        background: rgba(239, 68, 68, 0.15) !important;
+        outline: 2px solid rgba(239, 68, 68, 0.6) !important;
         outline-offset: -2px;
         border-radius: 12px;
+        box-shadow: 0 0 15px rgba(239, 68, 68, 0.4) !important;
+      }
+      .parallax-replying {
+        background: rgba(239, 68, 68, 0.15) !important;
+        outline: 3px solid rgba(239, 68, 68, 0.8) !important;
+        outline-offset: -2px;
+        border-radius: 12px;
+        box-shadow: 0 0 20px rgba(239, 68, 68, 0.5) !important;
       }
       body.parallax-chat-expand [data-testid="DmScrollerContainer"] {
         height: auto !important;
@@ -1126,7 +1197,7 @@ Write ONLY the reply text, nothing else:`
               // Fallback for unidentified divs
               if (selector === 'div' || selector === 'main') {
                   const testId = scroller.getAttribute('data-testid');
-                  if (testId) selector += \`[data-testid="\${testId}"]\`;
+                  if (testId) selector += '[data-testid="' + testId + '"]';
               }
               console.log('[SCROLL] Detected ELEMENT scroll:', selector, value);
           } else {
@@ -1413,19 +1484,30 @@ Write ONLY the reply text, nothing else:`
           window.lastMouseY = e.clientY;
 
           const article = e.target.closest('article[data-testid="tweet"]');
-          window.lastArticleUnderMouse = article;
 
           if (article) {
+            // Always update lastArticleUnderMouse when over an article
+            // This preserves the reference for insertReply
+            window.lastArticleUnderMouse = article;
             const textEl = article.querySelector('[data-testid="tweetText"]');
             if (textEl) {
               const text = textEl.innerText.trim();
               if (text && text.length >= 5) {
                 window.hoveredTweetText = text;
                 window.targetArticle = article;
+              } else {
+                // Post has no meaningful text (image/video only) - clear hover text
+                window.hoveredTweetText = null;
+                window.targetArticle = article;
               }
+            } else {
+              // No text element at all - clear hover text
+              window.hoveredTweetText = null;
+              window.targetArticle = article;
             }
           } else {
-            // Clear hover text when mouse is NOT over an article
+            // Not over an article - clear hover text
+            // BUT keep lastArticleUnderMouse so insertReply still works
             window.hoveredTweetText = null;
             window.targetArticle = null;
           }
@@ -1500,33 +1582,154 @@ Write ONLY the reply text, nothing else:`
           }
         });
 
+        // Helper for simulated mouse clicks (more reliable than .click())
+        const simulateClick = (el, stopPropagation = false) => {
+          const rect = el.getBoundingClientRect();
+          const x = rect.left + rect.width / 2;
+          const y = rect.top + rect.height / 2;
+          const opts = { bubbles: !stopPropagation, cancelable: true, view: window, clientX: x, clientY: y };
+          el.dispatchEvent(new MouseEvent('mousedown', opts));
+          el.dispatchEvent(new MouseEvent('mouseup', opts));
+          el.dispatchEvent(new MouseEvent('click', opts));
+        };
+
         window.insertReply = async (replyText) => {
+          console.log('[INSERT] insertReply called with:', replyText?.slice(0, 50));
           const article = window.targetArticle || window.currentHoveredArticle || window.lastArticleUnderMouse;
-          if (!article) { console.log('No article found'); return false; }
+          if (!article) { console.log('[INSERT] No article found'); return false; }
+
+          // Check if we're on home/notifications - if so, open in split view instead
+          const currentPath = window.location.pathname;
+          // Check if we're on a feed page (home, notifications, lists, or profile timeline)
+          // Profile pages also use modal replies, so redirect to split view
+          const isPostPage = /^\\/[^/]+\\/status\\/\\d+/.test(currentPath);
+          const isFeedPage = !isPostPage; // If not a post page, treat as feed page
+
+          if (isFeedPage) {
+            console.log('[INSERT] On feed page - opening post in split view for reply');
+            // Find the post URL from the timestamp link
+            const timeLink = article.querySelector('a[href*="/status/"] time')?.closest('a');
+            const href = timeLink ? timeLink.getAttribute('href') : null;
+
+            if (href && /^\\/[^/]+\\/status\\/\\d+$/.test(href)) {
+              // Send split view request - the reply will be inserted by the post panel
+              console.log('[INSERT] Requesting split view for:', href);
+              console.log('[SPLIT_VIEW_REQUEST]' + JSON.stringify({ url: 'https://x.com' + href, replyText: replyText }));
+
+              // Mark the article
+              article.classList.add('parallax-replying');
+
+              // Clean up after a delay
+              setTimeout(() => {
+                window.targetArticle = null;
+                window.currentHoveredArticle = null;
+                window.hoveredTweetText = null;
+                window.isCtrlPressed = false;
+                document.querySelectorAll('.parallax-hover').forEach(el => el.classList.remove('parallax-hover'));
+                document.querySelectorAll('.parallax-replying').forEach(el => el.classList.remove('parallax-replying'));
+              }, 2000);
+
+              return true;
+            }
+          }
+
+          // For post pages, use the direct reply approach
+          // Mark the article as being replied to
+          article.classList.add('parallax-replying');
+
           const replyBtn = article.querySelector('[data-testid="reply"]');
-          if (!replyBtn) { console.log('No reply button found'); return false; }
-          replyBtn.click();
-          await new Promise(r => setTimeout(r, 800));
-          const composer = document.querySelector('[data-testid="tweetTextarea_0"]');
-          if (!composer) { console.log('No composer found'); return false; }
+          if (!replyBtn) {
+            console.log('[INSERT] No reply button found');
+            article.classList.remove('parallax-replying');
+            return false;
+          }
+
+          console.log('[INSERT] Clicking reply button with simulated click (no bubble)...');
+          simulateClick(replyBtn, true); // Stop propagation to prevent navigation
+
+          // Wait for modal to open and find composer with retries
+          let composer = null;
+          for (let i = 0; i < 20; i++) {
+            await new Promise(r => setTimeout(r, 150));
+            // Try multiple selectors - modal composer might be tweetTextarea_0 or in a dialog
+            composer = document.querySelector('[role="dialog"] [data-testid="tweetTextarea_0"]') ||
+                       document.querySelector('[role="dialog"] [role="textbox"][contenteditable="true"]') ||
+                       document.querySelector('[role="dialog"] .public-DraftEditor-content') ||
+                       document.querySelector('[data-testid="tweetTextarea_0"]');
+            if (composer) {
+              console.log('[INSERT] Found composer on attempt', i + 1);
+              break;
+            }
+            console.log('[INSERT] Waiting for composer, attempt', i + 1);
+          }
+
+          if (!composer) {
+            console.log('[INSERT] No composer found after retries');
+            article.classList.remove('parallax-replying');
+            return false;
+          }
+
+          // Focus the composer with simulated click
+          console.log('[INSERT] Focusing composer...');
+          composer.scrollIntoView({ behavior: 'instant', block: 'center' });
+          await new Promise(r => setTimeout(r, 50));
+          simulateClick(composer);
           composer.focus();
-          await new Promise(r => setTimeout(r, 150));
+          await new Promise(r => setTimeout(r, 100));
+
+          // Clear and insert text
+          console.log('[INSERT] Inserting text...');
           document.execCommand('selectAll', false, null);
           document.execCommand('insertText', false, replyText);
-          await new Promise(r => setTimeout(r, 300));
-          const submitBtn = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
-          if (submitBtn && !submitBtn.disabled) submitBtn.click();
+
+          // Wait for text to be inserted and button to enable
+          await new Promise(r => setTimeout(r, 400));
+
+          // Try to submit with retries
+          let submitted = false;
+          for (let i = 0; i < 15; i++) {
+            const submitBtn = document.querySelector('[role="dialog"] [data-testid="tweetButton"]') ||
+                              document.querySelector('[data-testid="tweetButton"]') ||
+                              document.querySelector('[data-testid="tweetButtonInline"]');
+            console.log('[INSERT] Submit attempt', i + 1, 'button:', !!submitBtn, 'disabled:', submitBtn?.disabled);
+            if (submitBtn && !submitBtn.disabled) {
+              console.log('[INSERT] Clicking submit button...');
+              simulateClick(submitBtn);
+              submitted = true;
+              break;
+            }
+            await new Promise(r => setTimeout(r, 150));
+          }
+
+          if (!submitted) {
+            console.log('[INSERT] Could not submit - button stayed disabled');
+          }
+
           await new Promise(r => setTimeout(r, 500));
+
+          // Clean up
           window.targetArticle = null;
           window.currentHoveredArticle = null;
           window.hoveredTweetText = null;
           window.isCtrlPressed = false;
           document.querySelectorAll('.parallax-hover').forEach(el => el.classList.remove('parallax-hover'));
+          document.querySelectorAll('.parallax-replying').forEach(el => el.classList.remove('parallax-replying'));
+          console.log('[INSERT] Done');
           return true;
         };
 
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape') {
+            // First try to close any open modal/dialog
+            const closeBtn = document.querySelector('[role="dialog"] [data-testid="app-bar-close"]') ||
+                             document.querySelector('[role="dialog"] [aria-label="Close"]') ||
+                             document.querySelector('[data-testid="app-bar-close"]');
+            if (closeBtn) {
+              closeBtn.click();
+              e.preventDefault();
+              return;
+            }
+            // Fall back to back button
             const backBtn = document.querySelector('[data-testid="app-bar-back"]') ||
                             document.querySelector('[aria-label="Back"]') ||
                             document.querySelector('button[aria-label*="Back"]');
